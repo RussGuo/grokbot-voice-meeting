@@ -158,14 +158,13 @@ def cmd_start(args: argparse.Namespace) -> int:
 
 def cmd_worker(args: argparse.Namespace) -> int:
     _load_env()
-    root = repo_root()
-    os.chdir(root)
-    sys.path.insert(0, str(root))
-    sys.path.insert(0, str(root / "voice"))
-    import main
+    home = os.environ.get("MEETING_HOME")
+    if home and Path(home).is_dir():
+        os.chdir(home)      # relative paths (runs/, links/) land in MEETING_HOME; otherwise the current dir
     from livekit.agents import cli
+    from meet.worker import server
     sys.argv = ["meet-worker", args.mode]
-    cli.run_app(main.server)
+    cli.run_app(server)
     return 0
 
 
