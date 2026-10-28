@@ -3,6 +3,24 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="referrer" content="no-referrer">
+<script>
+/* 加入链接把 liveKitUrl/token 放在 URL fragment（#...）里：浏览器不会把 fragment 发给服务器，
+ * 静态托管（GitHub Pages）的日志和 Referer 里都看不到 token。旧链接的 ?token= 仍然可读。
+ * 读完立刻从地址栏抹掉，避免进历史记录、被截图或复制转发。放在经典 script 里，不等模块的 CDN 加载。 */
+window.__join = (function () {
+  var h = new URLSearchParams(location.hash.replace(/^#/, ""));
+  var q = new URLSearchParams(location.search);
+  var pick = function (k) { return h.get(k) || q.get(k) || ""; };
+  var j = { url: pick("liveKitUrl") || pick("url"), token: pick("token") };
+  if (h.has("token") || h.has("liveKitUrl") || q.has("token")) {
+    q.delete("token"); h.delete("token"); h.delete("liveKitUrl"); h.delete("url");
+    var qs = q.toString(), hs = h.toString();
+    try { history.replaceState(null, "", location.pathname + (qs ? "?" + qs : "") + (hs ? "#" + hs : "")); } catch (e) {}
+  }
+  return j;
+})();
+</script>
 <title>多 Bot 语音会议</title>
 <style>
 :root { --bg:#0f1115; --panel:#171a21; --line:#262b36; --text:#e7e9ee; --dim:#8a93a6; --accent:#4ade80; --warn:#fbbf24; --red:#f87171; --blue:#60a5fa; }
@@ -69,6 +87,7 @@ main { display:grid; grid-template-columns: 1fr 340px; gap:16px; padding:16px 20
 #replaybar input { width:220px; }
 .cmt { font-size:13px; padding:5px 0; border-bottom:1px dashed var(--line); }
 .cmt:last-child { border:0 }
+a { color:var(--blue); }
 </style>
 </head>
 <body>
@@ -87,6 +106,7 @@ main { display:grid; grid-template-columns: 1fr 340px; gap:16px; padding:16px 20
 </header>
 <main>
   <div class="col">
+    <div class="panel" id="runs" style="display:none"><h2>回放</h2><div id="runlist"></div></div>
     <div class="panel"><h2>参会者</h2><div id="grid"></div></div>
     <div class="panel" style="flex:1;display:flex;flex-direction:column;min-height:0">
       <h2>实时字幕</h2><div id="captions"></div>
@@ -118,10 +138,11 @@ const roomName = params.get("room") || "meeting-dev";
 const replayRun = params.get("replay");
 let identity = params.get("identity") || "";
 // Pre-signed join (GitHub Pages or any static host). No token server required.
-const presetUrl = params.get("liveKitUrl") || params.get("url") || "";
-const presetToken = params.get("token") || "";
+// 已由 <head> 里的脚本读出并从地址栏抹掉（fragment 优先，兼容旧的 ?token=）。
+const presetUrl = window.__join.url;
+const presetToken = window.__join.token;
 const $ = (id) => document.getElementById(id);
-const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const fmt = (ms) => { const s = Math.max(0, Math.floor(ms / 1000)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; };
 const COLORS = ["#4ade80", "#60a5fa", "#f472b6", "#fbbf24", "#a78bfa", "#34d399", "#fb923c"];
 
@@ -137,7 +158,7 @@ function ensureTile(id) {
   if (!id || tiles.has(id)) return tiles.get(id);
   const i = tiles.size, c = COLORS[i % COLORS.length];
   const el = document.createElement("div"); el.className = "tile";
-  el.innerHTML = `<span class="hand">✋</span><div class="av" style="background:${c}">${esc(name(id)).slice(0, 1)}</div>
+  el.innerHTML = `<span class="hand">✋</span><div class="av" style="background:${c}"></div>
     <div class="nm"></div><div class="tag"></div><canvas width="300" height="56"></canvas>`;
   $("grid").appendChild(el);
   const t = { el, color: c, canvas: el.querySelector("canvas"), level: 0, hist: new Array(60).fill(0) };
@@ -266,7 +287,7 @@ const PHASE = { Inviting: "邀请中", Preparing: "会前准备", OpeningSync: "
 /* ---------------- 纪要 ---------------- */
 async function onEnded() {
   $("showmin").disabled = false;
-  if (replayRun && !S.minutes) S.minutes = await (await fetch(`/api/replay/${replayRun}/minutes`)).json();
+  if (replayRun && !S.minutes) S.minutes = await (await fetch(`/api/replay/${encodeURIComponent(replayRun)}/minutes`)).json();
   if (S.minutes) showMinutes();
 }
 function showMinutes() {
@@ -390,18 +411,30 @@ $("mute").onclick = async () => { const on = room.localParticipant.isMicrophoneE
 $("leave").onclick = () => room?.disconnect();
 if (presetUrl && presetToken && !replayRun) $("status").textContent = "链接已带 token，点击加入";
 
+/* ---------------- 回放入口：本地 token_server 才有 /api/replay；静态托管上 404，面板保持隐藏 ---------------- */
+if (!replayRun && !presetToken) (async () => {
+  try {
+    const r = await fetch("/api/replay");
+    if (!r.ok) return;
+    const runs = ((await r.json()).runs || []).filter((x) => typeof x === "string").reverse();
+    if (!runs.length) return;
+    $("runlist").innerHTML = runs.map((x) => `<div class="q"><a href="?replay=${encodeURIComponent(x)}">${esc(x)}</a></div>`).join("");
+    $("runs").style.display = "";
+  } catch {}
+})();
+
 /* ---------------- 回放模式 ---------------- */
 if (replayRun) (async () => {
   $("join").style.display = "none"; $("replaybar").style.display = "flex"; $("status").textContent = `回放 ${replayRun}（打断/结束按钮仅实时会议可用）`;
-  const j = await (await fetch(`/api/replay/${replayRun}/events`)).json();
-  RL = await (await fetch(`/api/replay/${replayRun}/levels`)).json();
+  const j = await (await fetch(`/api/replay/${encodeURIComponent(replayRun)}/events`)).json();
+  RL = await (await fetch(`/api/replay/${encodeURIComponent(replayRun)}/levels`)).json();
   const evs = j.events.sort((a, b) => a.seq - b.seq); const off = j.audio_offset_ms || 0;
   for (const e of evs) {
     if (e.type === "FloorGranted") TL.push([e.at, e.data.token.holder_id]);
     else if (e.type === "FloorReleased" || e.type === "FloorRevoked") TL.push([e.at + 300, null]);
   }
   const endAt = evs.length ? evs[evs.length - 1].at : 0;
-  const audio = new Audio(`/api/replay/${replayRun}/audio`); audio.preload = "auto"; audio.crossOrigin = "anonymous";
+  const audio = new Audio(`/api/replay/${encodeURIComponent(replayRun)}/audio`); audio.preload = "auto"; audio.crossOrigin = "anonymous";
   let srcNode; let idx = 0;
   const startAt = Number(params.get("t") || 0) * 1000;
   function reset() { Object.assign(S, { names: {}, agenda: [], curItem: null, itemStart: {}, closed: new Set(), speaker: null, speakerState: "idle", hands: new Map(), queries: new Map(), commits: [], decisions: [], ended: false, now: 0 });

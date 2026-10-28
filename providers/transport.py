@@ -9,13 +9,16 @@ from providers.base import RealtimeTransport
 
 
 def _join_urls(url: str, token: str, join_page: str | None) -> dict[str, str]:
+    # meet.livekit.io is third-party and only understands the query form, so the token goes to its
+    # server in the request line. Prefer the static page below, where the token stays in the fragment.
     live = f"https://meet.livekit.io/custom?liveKitUrl={quote(url, safe='')}&token={token}"
     out = {"livekit": live}
     page = (join_page or os.environ.get("MEETING_JOIN_PAGE") or "").strip().rstrip("/")
     if page:
-        # Static UI (GitHub Pages or any host). Same query the page reads; no token server.
-        sep = "&" if "?" in page else "?"
-        out["static"] = f"{page}{sep}liveKitUrl={quote(url, safe='')}&token={token}"
+        # Static UI (GitHub Pages or any host). The credentials live in the URL fragment: browsers never
+        # send a fragment to the host, so the token stays out of server logs and Referer headers.
+        page = page.split("#", 1)[0]
+        out["static"] = f"{page}#liveKitUrl={quote(url, safe='')}&token={quote(token, safe='')}"
     return out
 
 

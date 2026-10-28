@@ -9,7 +9,10 @@ Library use:
     path = asyncio.run(make_link(room, scene))
 
 Scene is the dict produced by orchestrator.scene.build_scene
-({who, topic, agenda, briefs, voices}). The worker reads it from job metadata.
+({who, topic, agenda, briefs, voices}). The worker reads it from dispatch (job) metadata only.
+Room metadata is visible to every participant holding a token, so it carries just a small public
+summary (see public_room_metadata), never briefs. The full scene is also saved beside the link
+(<room>.scene.json, chmod 600) so `scripts/dispatch.py` can dispatch it later.
 """
 import argparse
 import asyncio
@@ -26,8 +29,19 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 load_dotenv(Path.cwd() / ".env")
 load_dotenv(ROOT / ".env")
-SAFE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+SAFE = re.compile(r"[A-Za-z0-9_-]{1,64}")  # use fullmatch: `$` would accept a trailing newline
 MAX_META = 60_000  # LiveKit metadata is about 64KB. Large briefs belong in files.
+
+
+def public_room_metadata(scene: dict) -> str:
+    """Room metadata: readable by every participant, so only non-sensitive facts, never briefs or voices.
+
+    The summary is nested under "room" on purpose. orchestrator.scene.load_scene_metadata treats any
+    top-level object with topic/who as a scene, and this one must never be mistaken for one.
+    """
+    who = [str(x) for x in (scene.get("who") or []) if isinstance(x, (str, int))]
+    topic = str(scene.get("topic") or scene.get("title") or "")[:120]
+    return json.dumps({"v": 1, "room": {"topic": topic, "who": who}}, ensure_ascii=False)
 
 
 def _human_name() -> str:
@@ -36,7 +50,7 @@ def _human_name() -> str:
 
 async def make_link(room: str, scene: dict, out: Path | None = None, hours: float = 2.0,
                     dispatch: bool = True, empty_timeout_s: int = 30 * 60) -> Path:
-    if not SAFE.match(room):
+    if not SAFE.fullmatch(room):
         raise ValueError("room must match [A-Za-z0-9_-]{1,64}")
     meta = json.dumps(scene, ensure_ascii=False)
     if len(meta.encode()) > MAX_META:
@@ -46,7 +60,7 @@ async def make_link(room: str, scene: dict, out: Path | None = None, hours: floa
     url = os.environ["LIVEKIT_URL"]
     agent = os.environ.get("LIVEKIT_AGENT_NAME", "voice-meeting")
     human = os.environ.get("MEETING_HUMAN_IDENTITY", "host")
-    await transport.ensure_room(room, meta, empty_timeout_s)
+    await transport.ensure_room(room, public_room_metadata(scene), empty_timeout_s)
     if dispatch:
         await transport.dispatch(room, meta, agent)
     token = transport.access_token(room=room, identity=human, display_name=_human_name(), hours=hours)
@@ -61,7 +75,8 @@ async def make_link(room: str, scene: dict, out: Path | None = None, hours: floa
     with os.fdopen(fd, "w") as f:
         f.write(body)
     os.chmod(out, 0o600)
-    # Stash the scene beside the link so a follow-up can see who was invited. chmod 600: it may contain briefs.
+    # Stash the full scene beside the link: it is what `scripts/dispatch.py` sends after `--no-dispatch`.
+    # chmod 600: it may contain briefs.
     scene_path = out.with_suffix(".scene.json")
     fd = os.open(scene_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
