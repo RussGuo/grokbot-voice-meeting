@@ -25,8 +25,17 @@ def build(events: Iterable[MeetingEvent]) -> dict:
     hands: dict[str, dict] = {}                  # hand_id → 举手记录
     granted_hands: list[dict] = []
     end_by = None
+    added_items: list[dict] = []                 # 会中新增的议程项 / 改名 / 入会的 bot（网页控制）
+    renamed: dict[str, str] = {}
+    joined: list[dict] = []
     for e in events:
         d = e.data
+        if e.type == "AgendaItemAdded":
+            added_items.append(dict(d["agenda_item"]))
+        elif e.type == "AgendaItemRenamed":
+            renamed[d["agenda_item_id"]] = d["title"]
+        elif e.type == "BotJoined":
+            joined.append(dict(d["participant"]))
         if e.type == "FloorGranted":
             src[d["token"]["id"]] = d["token"].get("source", "")
             if d["token"].get("source") == "handRaise":
@@ -78,6 +87,10 @@ def build(events: Iterable[MeetingEvent]) -> dict:
         if h["result"] == "queued":
             h["result"] = "not_reached"
     meta = {**meta, "language": normalize(meta.get("language"))}      # 复制一份，不改事件里的 payload
+    if added_items or renamed or joined:
+        meta["agenda"] = [{**a, "title": renamed.get(a["id"], a["title"])} for a in [*meta.get("agenda", []), *added_items]]
+        meta["participants"] = [*meta.get("participants", []), *joined]
+        names.update({p["id"]: p["display_name"] for p in joined})
     return {"meta": meta, "names": names, "utterances": utt, "decisions": decisions,
             "actions": actions, "deferred": deferred, "hands": list(hands.values()),
             "hand_grants": len(granted_hands), "end_by": end_by}

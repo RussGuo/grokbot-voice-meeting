@@ -48,6 +48,7 @@ def turn(lang: str | None, intent: str) -> str:
         "directive": "The human just directed you to speak. Address that request.",
         "cue": "Give a one-sentence position on the current item.",
         "warn": "Say that about ten seconds remain.",
+        "bot_joined": "Announce that a new participant has joined the meeting.",
     }
     zh = {
         "answer": "回应刚才的发言。",
@@ -61,6 +62,7 @@ def turn(lang: str | None, intent: str) -> str:
         "directive": "用户刚点名让你说。直接回应这个要求。",
         "cue": "用一句话说明你在当前议题上的立场。",
         "warn": "还剩大约十秒。",
+        "bot_joined": "宣布有新成员加入会议。",
     }
     table = en if normalize(lang) == "en" else zh
     return table.get(intent, intent)
@@ -91,6 +93,7 @@ def moderator_lines(lang: str | None, *, chief: bool) -> dict[str, str]:
             "ask_human": "The bots have gone a few rounds. What do you think?",
             "cue": "Please go ahead, {target}.",
             "warn": "About ten seconds left.",
+            "bot_joined": "{target} has joined the meeting.",
         }
     opening = ("我是 Chief of Staff，兼任本场主持，我有自己的立场，小结会尽量中立。" if chief else "欢迎。")
     return {
@@ -102,6 +105,7 @@ def moderator_lines(lang: str | None, *, chief: bool) -> dict[str, str]:
         "ask_human": "bot 们已经连续讨论了好几轮，用户，你怎么看？",
         "cue": "请{target}说说。",
         "warn": "还剩 10 秒。",
+        "bot_joined": "{target}加入了会议。",
     }
 
 

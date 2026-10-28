@@ -38,6 +38,9 @@ class Scorer(Protocol):
     def score(self, bot_id: ID, text: str, said_in_item: list[str], penalty: float,
               agenda_item_id: ID = "") -> tuple[HandScore, str]: ...
 
+    def add_bot(self, bot_id: ID, brief: Brief, aliases: list[str]) -> None:
+        """会中加入 bot：登记 brief 与称呼，之后它可以举手、被点名。"""
+
     def bind(self, deliver: Callable[[Millis, dict], None]) -> None:
         """编排器建好后注入「投递事件」函数（principal.deliver_to）。"""
 
