@@ -20,6 +20,32 @@ def _env(name: str, default: str = "") -> str:
     return (os.environ.get(name) or default).strip()
 
 
+_BOT_INSTRUCTIONS = {
+    "zh": "你是{name}的语音分身，代表它参加这场会。只根据会前 brief 说话；brief 里写着未知的，就说不知道，不要编。",
+    "en": "You are the voice stand-in for {name}. Speak only from the pre-meeting brief. If a field says unknown, say you don't know. Do not invent facts.",
+}
+
+
+def bot_participant(bid: str, meta: dict, voice: str, language: str = "zh") -> dict[str, Any]:
+    """一个成员 bot 的参会者 dict。build_scene 与会中加 bot（meet/live_controls.py）共用，保证两处一致。"""
+    lang = normalize(language)
+    name = meta.get("display_name") or bid
+    aliases = list(dict.fromkeys([name, bid, *(meta.get("aliases") or [])]))
+    return {
+        "id": bid,
+        "kind": "bot",
+        "display_name": name,
+        "role": "member",
+        "aliases": aliases,
+        "principal_ref": {"bot_id": meta.get("principal") or bid, "channel": "message"},
+        "agent_profile": {
+            "tts_voice": voice,
+            "llm": "openai",
+            "instructions": _BOT_INSTRUCTIONS[lang].format(name=name),
+        },
+    }
+
+
 def build_scene(*, who: list[str], topic: str, agenda: list[str] | None, briefs: dict[str, dict],
                 voices: dict[str, str], registry: dict[str, dict], language: str = "zh",
                 human_id: str | None = None, human_name: str | None = None,
@@ -42,10 +68,6 @@ def build_scene(*, who: list[str], topic: str, agenda: list[str] | None, briefs:
             "goal": "discuss",
             "keywords": [],
         })
-    instructions = {
-        "zh": "你是{name}的语音分身，代表它参加这场会。只根据会前 brief 说话；brief 里写着未知的，就说不知道，不要编。",
-        "en": "You are the voice stand-in for {name}. Speak only from the pre-meeting brief. If a field says unknown, say you don't know. Do not invent facts.",
-    }[lang]
     mod_instructions = {
         "zh": "你是这场会议的中立主持人。按议程推进、点名还没说话的人、小结时不要站队。",
         "en": "You are the neutral host. Move through the agenda, invite people who have not spoken, and keep summaries neutral.",
@@ -65,22 +87,7 @@ def build_scene(*, who: list[str], topic: str, agenda: list[str] | None, briefs:
         "agent_profile": {"tts_voice": voices.get(mid, ""), "llm": "openai", "instructions": mod_instructions},
     }]
     for bid in who:
-        meta = registry.get(bid, {})
-        name = meta.get("display_name") or bid
-        aliases = list(dict.fromkeys([name, bid, *(meta.get("aliases") or [])]))
-        participants.append({
-            "id": bid,
-            "kind": "bot",
-            "display_name": name,
-            "role": "member",
-            "aliases": aliases,
-            "principal_ref": {"bot_id": meta.get("principal") or bid, "channel": "message"},
-            "agent_profile": {
-                "tts_voice": voices.get(bid, ""),
-                "llm": "openai",
-                "instructions": instructions.format(name=name),
-            },
-        })
+        participants.append(bot_participant(bid, registry.get(bid, {}), voices.get(bid, ""), lang))
     return {
         "version": 1,
         "topic": topic,
@@ -169,16 +176,21 @@ def scene_to_meeting(data: dict, *, human_id: str | None = None) -> tuple[Meetin
     for pid, blob in raw_briefs.items():
         if not isinstance(blob, dict):
             continue
-        blob = dict(blob)
-        blob.setdefault("participant_id", pid)
-        blob.setdefault("agenda_item_ids", [a.id for a in meeting.agenda])
-        blob.setdefault("positions", [])
-        blob.setdefault("memory_snapshot", {"topic": meeting.title, "facts": []})
-        blob.setdefault("mandate", {"can_commit": [], "must_ask": []})
-        briefs[pid] = Brief.from_dict(blob)
+        briefs[pid] = brief_from_blob(pid, blob, meeting.title, [a.id for a in meeting.agenda])
     if mid not in briefs:
         briefs[mid] = _empty_moderator_brief(mid, meeting, lang)
     return meeting, briefs
+
+
+def brief_from_blob(pid: str, blob: dict, topic: str, agenda_ids: list[str]) -> Brief:
+    """brief 的 dict（来自场景或 meet.briefs.summarize）补齐缺省字段后转成 Brief。"""
+    blob = dict(blob)
+    blob.setdefault("participant_id", pid)
+    blob.setdefault("agenda_item_ids", list(agenda_ids))
+    blob.setdefault("positions", [])
+    blob.setdefault("memory_snapshot", {"topic": topic, "facts": []})
+    blob.setdefault("mandate", {"can_commit": [], "must_ask": []})
+    return Brief.from_dict(blob)
 
 
 def _empty_moderator_brief(mid: str, meeting: Meeting, lang: str) -> Brief:

@@ -1,0 +1,147 @@
+name: E2E meeting
+
+# Manual only: runs a real simulated meeting against LiveKit, Volcengine and DeepSeek.
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Run id (default: e2e-<timestamp>); letters, digits, - and _ only"
+        required: false
+        default: ""
+      max_stop_ms:
+        description: "Barge-in acceptance limit: human voice onset to bot silence, in ms"
+        required: false
+        default: "700"
+      regress_pct:
+        description: "Fail if a latency P95 is worse than docs/baseline/stats.json by more than this percent"
+        required: false
+        default: "20"
+
+# One meeting at a time: the simulation uses a fixed room and run_sim.sh refuses parallel workers.
+concurrency:
+  group: e2e-meeting
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      LIVEKIT_URL: ${{ secrets.LIVEKIT_URL }}
+      LIVEKIT_API_KEY: ${{ secrets.LIVEKIT_API_KEY }}
+      LIVEKIT_API_SECRET: ${{ secrets.LIVEKIT_API_SECRET }}
+      VOLC_API_KEY: ${{ secrets.VOLC_API_KEY }}
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      INPUT_RUN_ID: ${{ inputs.run_id }}
+      MAX_STOP_MS: ${{ inputs.max_stop_ms }}
+      REGRESS_PCT: ${{ inputs.regress_pct }}
+    steps:
+      - name: Check secrets
+        shell: bash
+        run: |
+          missing=""
+          for name in LIVEKIT_URL LIVEKIT_API_KEY LIVEKIT_API_SECRET VOLC_API_KEY DEEPSEEK_API_KEY; do
+            if [ -z "${!name}" ]; then missing="$missing $name"; fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secrets:$missing"
+            echo "Add them under Settings > Secrets and variables > Actions, then run this workflow again."
+            exit 1
+          fi
+
+      - name: Resolve inputs
+        shell: bash
+        run: |
+          run_id="${INPUT_RUN_ID:-e2e-$(date +%Y%m%d-%H%M%S)}"
+          if ! [[ "$run_id" =~ ^[A-Za-z0-9_-]{1,64}$ ]]; then
+            echo "::error::run_id must match [A-Za-z0-9_-]{1,64}"; exit 1
+          fi
+          for v in "$MAX_STOP_MS" "$REGRESS_PCT"; do
+            [[ "$v" =~ ^[0-9]+$ ]] || { echo "::error::max_stop_ms and regress_pct must be integers"; exit 1; }
+          done
+          echo "RUN_ID=$run_id" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: System packages
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+
+      - name: Install
+        # run_sim.sh expects .venv (worker) and web/.venv (sim tools); one environment serves both.
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install -e .
+          ln -s ../.venv web/.venv
+          .venv/bin/python main.py download-files || echo "download-files failed; continuing"
+
+      - name: Synthesize the simulated human's lines
+        # sim/lines/*.wav is not committed; run_sim.sh plays them as the human participant.
+        working-directory: voice
+        run: ../.venv/bin/python bench/synth_human_lines.py
+
+      - name: Run simulated meeting
+        # run_sim.sh ends with acceptance.py at the default limit; the step after this one is authoritative.
+        run: bash scripts/run_sim.sh "$RUN_ID" || echo "run_sim.sh exited $?"
+
+      - name: Acceptance
+        shell: bash
+        run: |
+          .venv/bin/python scripts/acceptance.py "runs/$RUN_ID" --max-stop-ms "$MAX_STOP_MS" | tee "runs/$RUN_ID/acceptance.txt"
+          cat "runs/$RUN_ID/acceptance.txt" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Latency stats
+        if: always()
+        shell: bash
+        run: |
+          [ -f "runs/$RUN_ID/events.jsonl" ] || { echo "no events.jsonl, nothing to measure"; exit 0; }
+          .venv/bin/python -m meet stats "runs/$RUN_ID" --json > "runs/$RUN_ID/stats.json"
+          args=()
+          if [ -f docs/baseline/stats.json ]; then
+            args=(--baseline docs/baseline/stats.json --fail-on-regress "$REGRESS_PCT")
+          else
+            echo "No docs/baseline/stats.json; reporting without a baseline."
+          fi
+          set +e
+          .venv/bin/python -m meet stats "runs/$RUN_ID" "${args[@]}" | tee "runs/$RUN_ID/stats.txt"
+          status=${PIPESTATUS[0]}
+          { echo '```'; cat "runs/$RUN_ID/stats.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          exit $status
+
+      - name: Audio size
+        if: always()
+        id: audio
+        shell: bash
+        run: |
+          kb=$(du -sk "runs/$RUN_ID/audio" 2>/dev/null | cut -f1)
+          kb=${kb:-0}
+          echo "Audio: ${kb} KB"
+          if [ "$kb" -le 51200 ]; then echo "small=true" >> "$GITHUB_OUTPUT"; else echo "small=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Upload run (without audio)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-${{ env.RUN_ID }}
+          path: |
+            runs/${{ env.RUN_ID }}
+            !runs/${{ env.RUN_ID }}/audio/**
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload audio (50 MB or less)
+        if: always() && steps.audio.outputs.small == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: audio-${{ env.RUN_ID }}
+          path: runs/${{ env.RUN_ID }}/audio
+          if-no-files-found: ignore
+          retention-days: 7

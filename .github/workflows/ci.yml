@@ -20,7 +20,7 @@ jobs:
       - name: Install
         run: pip install -e ".[dev]"
       - name: Lint
-        run: ruff check meet providers orchestrator/scene.py orchestrator/i18n.py orchestrator/commitments.py orchestrator/principal.py meet/cli.py scripts/mklink.py scripts/acceptance.py
+        run: ruff check .
       - name: Tests
         run: python -m pytest orchestrator/tests meet/tests providers/tests -q
       - name: Voice tests

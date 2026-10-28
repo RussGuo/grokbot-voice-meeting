@@ -2,7 +2,7 @@
 
 输出到 run_dir：
   events.jsonl            事件日志
-  minutes.md              纪要（议程、决策、各方发言要点、行动项、会后补充）
+  minutes.md              纪要（议程、决策、各方发言要点、行动项、会后补充；语言取 MeetingCreated.payload.language）
   actions/<owner_id>.json 每个 owner 一份行动项（分发给对应本体的待办 / 对账）
 """
 from __future__ import annotations
@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .events import EventLog, MeetingEvent
+from .i18n import minutes_labels, normalize
 
 
 def build(events: Iterable[MeetingEvent]) -> dict:
@@ -24,8 +25,17 @@ def build(events: Iterable[MeetingEvent]) -> dict:
     hands: dict[str, dict] = {}                  # hand_id → 举手记录
     granted_hands: list[dict] = []
     end_by = None
+    added_items: list[dict] = []                 # 会中新增的议程项 / 改名 / 入会的 bot（网页控制）
+    renamed: dict[str, str] = {}
+    joined: list[dict] = []
     for e in events:
         d = e.data
+        if e.type == "AgendaItemAdded":
+            added_items.append(dict(d["agenda_item"]))
+        elif e.type == "AgendaItemRenamed":
+            renamed[d["agenda_item_id"]] = d["title"]
+        elif e.type == "BotJoined":
+            joined.append(dict(d["participant"]))
         if e.type == "FloorGranted":
             src[d["token"]["id"]] = d["token"].get("source", "")
             if d["token"].get("source") == "handRaise":
@@ -33,9 +43,9 @@ def build(events: Iterable[MeetingEvent]) -> dict:
         elif e.type in ("HandRaised", "HandExpired", "HandWithdrawn"):
             h = d["hand"]
             r = hands.setdefault(h["id"], {"who": h["participant_id"], "at": e.at, "gist": h.get("gist", ""),
-                                           "score": (h.get("score") or {}).get("total"), "result": "排队"})
+                                           "score": (h.get("score") or {}).get("total"), "result": "queued"})
             if e.type != "HandRaised":
-                r["result"] = {"HandExpired": "过期", "HandWithdrawn": "撤回"}[e.type]
+                r["result"] = {"HandExpired": "expired", "HandWithdrawn": "withdrawn"}[e.type]
         elif e.type == "EndConfirm" and d.get("stage") in ("human_command", "confirmed", "timeout"):
             end_by = (e.at, d.get("stage"), d.get("text", ""))
         if e.type == "UtteranceFinal" and not d["utterance"].get("interrupted"):
@@ -43,7 +53,14 @@ def build(events: Iterable[MeetingEvent]) -> dict:
             utt.append((e.at, u["speaker_id"], u["agenda_item_id"], u["text"], u.get("provenance"),
                         src.get(u.get("token_id") or "", "")))
         elif e.type == "DecisionRecorded":
-            decisions.append(d["payload"])
+            decisions.append(dict(d["payload"]))
+        elif e.type == "DecisionSummarized":     # 后台总结落地：覆盖同一议程项先前记录的兜底文本
+            p = d["payload"]
+            cur = next((x for x in reversed(decisions) if x.get("agenda_item_id") == p.get("agenda_item_id")), None)
+            if cur is None:
+                decisions.append(dict(p))
+            else:
+                cur.update(text=p["text"], method=p.get("method", "summary"))
         elif e.type == "CommitmentMade":
             c = d["commitment"]
             actions.setdefault(c["owner_id"], []).append({
@@ -62,12 +79,18 @@ def build(events: Iterable[MeetingEvent]) -> dict:
             a["status"] = status.get(a["id"], a["status"])
     # 举手结果：与随后同一 bot 的 handRaise 授予配对
     for g in granted_hands:
-        cand = [h for h in hands.values() if h["who"] == g["who"] and h["at"] <= g["at"] and h["result"] == "排队"]
+        cand = [h for h in hands.values() if h["who"] == g["who"] and h["at"] <= g["at"] and h["result"] == "queued"]
         if cand:
-            cand[-1]["result"] = f"{g['at'] / 1000:.1f}s 获准发言"
+            cand[-1]["result"] = "granted"
+            cand[-1]["granted_at"] = g["at"]
     for h in hands.values():
-        if h["result"] == "排队":
-            h["result"] = "未轮到"
+        if h["result"] == "queued":
+            h["result"] = "not_reached"
+    meta = {**meta, "language": normalize(meta.get("language"))}      # 复制一份，不改事件里的 payload
+    if added_items or renamed or joined:
+        meta["agenda"] = [{**a, "title": renamed.get(a["id"], a["title"])} for a in [*meta.get("agenda", []), *added_items]]
+        meta["participants"] = [*meta.get("participants", []), *joined]
+        names.update({p["id"]: p["display_name"] for p in joined})
     return {"meta": meta, "names": names, "utterances": utt, "decisions": decisions,
             "actions": actions, "deferred": deferred, "hands": list(hands.values()),
             "hand_grants": len(granted_hands), "end_by": end_by}
@@ -75,32 +98,39 @@ def build(events: Iterable[MeetingEvent]) -> dict:
 
 def render_md(b: dict) -> str:
     m, n = b["meta"], b["names"]
-    out = [f"# 纪要：{m.get('title', '')}", "", "（由事件流生成；分身承诺当场生效，会后由本体对账）", "", "## 议程"]
+    L = minutes_labels(m.get("language"))
+    titles = {a["id"]: a["title"] for a in m.get("agenda", [])}
+    out = [L["title"].format(title=m.get("title", "")), "", L["note"], "", L["agenda"]]
     out += [f"- {a['title']}" for a in m.get("agenda", [])]
-    out += ["", "## 决策"] + [f"- {d['text']}" for d in b["decisions"]] or ["- 无"]
-    out += ["", "## 发言记录"]
-    src_tag = {"handRaise": "【举手】", "pendingAnswer": "【本体答复插回】", "human": ""}
+    out += ["", L["decisions"]]
+    out += [L["decision_item"].format(title=d.get("title") or titles.get(d.get("agenda_item_id"), ""), text=d["text"])
+            for d in b["decisions"]] or [L["none"]]
+    out += ["", L["transcript"]]
+    src_tag = {"handRaise": L["tag_hand"], "pendingAnswer": L["tag_pending"], "human": ""}
     for at, sp, ag, text, prov, source in b["utterances"]:
-        tag = f"（{prov}）" if prov and prov != "model" else ""
+        tag = L["prov"].format(prov=prov) if prov and prov != "model" else ""
         tag = src_tag.get(source, "") + tag
-        out.append(f"- {at / 1000:6.1f}s [{ag}] {n.get(sp, sp)}{tag}：{text}")
-    out += ["", "## 发言秩序（举手申请）"]
-    out.append(f"- 举手 {len(b['hands'])} 次，获准发言 {b['hand_grants']} 次")
+        out.append(L["utt"].format(t=at / 1000, ag=ag, name=n.get(sp, sp), tag=tag, text=text))
+    out += ["", L["floor"]]
+    out.append(L["hands"].format(n=len(b["hands"]), m=b["hand_grants"]))
     for h in b["hands"]:
-        sc = f"，得分 {h['score']:.2f}" if isinstance(h.get("score"), (int, float)) else ""
-        out.append(f"- {h['at'] / 1000:6.1f}s {n.get(h['who'], h['who'])} 举手：{(h['gist'] or '（无摘要）').rstrip('。，')}{sc} → {h['result']}")
+        sc = L["score"].format(s=h["score"]) if isinstance(h.get("score"), (int, float)) else ""
+        res = L["r_granted"].format(t=h.get("granted_at", 0) / 1000) if h["result"] == "granted" else \
+            L[{"expired": "r_expired", "withdrawn": "r_withdrawn", "not_reached": "r_queued"}[h["result"]]]
+        gist = (h["gist"] or L["no_gist"]).rstrip("。，.,")
+        out.append(L["hand"].format(t=h["at"] / 1000, name=n.get(h["who"], h["who"]), gist=gist, score=sc, result=res))
     if b.get("end_by"):
         at, stage, text = b["end_by"]
-        how = {"human_command": "用户宣布结束", "confirmed": "用户确认结束", "timeout": "无人回应超时结束"}[stage]
-        out.append(f"- 散会：{at / 1000:.1f}s {how}" + (f"（「{text}」）" if text else ""))
-    out += ["", "## 行动项（按 owner）"]
+        how = L[{"human_command": "end_human_command", "confirmed": "end_confirmed", "timeout": "end_timeout"}[stage]]
+        out.append(L["end"].format(t=at / 1000, how=how, quote=L["end_quote"].format(text=text) if text else ""))
+    out += ["", L["actions"]]
     if not b["actions"]:
-        out.append("- 无")
+        out.append(L["none"])
     for owner, items in b["actions"].items():
         for a in items:
-            out.append(f"- {n.get(owner, owner)}：{a['title']}（{a['status']}）")
-    out += ["", "## 会后补充（本体答案未在会上送达）"]
-    out += [f"- {q['asked_by']}：{q['question']}" for q in b["deferred"]] or ["- 无"]
+            out.append(L["action"].format(owner=n.get(owner, owner), title=a["title"], status=a["status"]))
+    out += ["", L["followup"]]
+    out += [L["deferred"].format(who=q["asked_by"], q=q["question"]) for q in b["deferred"]] or [L["none"]]
     return "\n".join(out) + "\n"
 
 

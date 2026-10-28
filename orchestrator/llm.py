@@ -98,22 +98,39 @@ class DeepSeekChat:
         thinking = "disabled" if self.cfg.provider == "deepseek" else None
         return self.stream(messages, max_tokens=max_tokens, temperature=temperature, thinking=thinking).text
 
+    def _async_client(self):
+        """复用同一个 AsyncOpenAI（连接池 / TLS 会话），每轮新建会白白多出一次握手的首 token 延迟。"""
+        c = getattr(self, "_aclient", None)
+        if c is None:
+            from openai import AsyncOpenAI
+            c = self._aclient = AsyncOpenAI(base_url=self.cfg.base_url, api_key=self.cfg.api_key)
+        return c
+
     async def astream_text(self, messages: list[dict], *, max_tokens: int = 200,
-                           thinking: Optional[str] = "disabled"):
+                           thinking: Optional[str] = "disabled", temperature: Optional[float] = None):
         """异步逐段产出正文（main.py 送 TTS 用）。语音场景默认关思考以降首 token。"""
-        from openai import AsyncOpenAI
-        client = AsyncOpenAI(base_url=self.cfg.base_url, api_key=self.cfg.api_key)
+        client = self._async_client()
         kw = {}
         body = thinking_body(self._thinking(thinking))
         if body:
             kw["extra_body"] = body
+        if temperature is not None:
+            kw["temperature"] = temperature
         resp = await client.chat.completions.create(model=self.cfg.model, messages=messages,
                                                     max_tokens=max_tokens, stream=True, **kw)
-        async for chunk in resp:
-            if chunk.choices:
-                piece = getattr(chunk.choices[0].delta, "content", None)
-                if piece:
-                    yield piece
+        try:
+            async for chunk in resp:
+                if chunk.choices:
+                    piece = getattr(chunk.choices[0].delta, "content", None)
+                    if piece:
+                        yield piece
+        finally:                                  # 调用方中止（令牌失效）时关掉上游连接，不再白烧 token
+            close = getattr(resp, "close", None)
+            if close is not None:
+                try:
+                    await close()
+                except Exception:  # noqa: BLE001
+                    pass
 
 
 class MockChat:

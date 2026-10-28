@@ -1,4 +1,4 @@
-from orchestrator.models import HandScore, MeetingRules, PrincipalQuery
+from orchestrator.models import MeetingRules, PrincipalQuery
 from orchestrator.scheduler import Cue, Scheduler, cooldown_penalty, hand_score, should_raise
 
 R = MeetingRules()

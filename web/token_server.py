@@ -7,16 +7,19 @@
 可选：
   LIVEKIT_AGENT_NAME  若 agent 用显式 dispatch（agent_name），在 token 里带上，进房即派发
   WEB_HOST / WEB_PORT 默认 127.0.0.1 / 8787
+  MEETING_ACCESS_KEY  设了即「公网模式」：口令走 `Authorization: Bearer <key>` 头或 cookie；
+                      旧的 `?k=<key>` 仍可用但不推荐（会留在地址栏和上游日志里）。口令不写进本进程的日志。
 """
 import os
 import re
 from pathlib import Path
 
 from aiohttp import web
+from aiohttp.web_log import AccessLogger
 from livekit import api
 
 HERE = Path(__file__).parent
-SAFE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
+SAFE = re.compile(r"[A-Za-z0-9_\-]{1,64}")  # use fullmatch: `$` would accept a trailing newline
 
 
 def _env(name: str) -> str:
@@ -29,7 +32,7 @@ def _env(name: str) -> str:
 async def token(request: web.Request) -> web.Response:
     room = request.query.get("room", "meeting-dev")
     identity = request.query.get("identity") or os.environ.get("MEETING_HUMAN_IDENTITY", "host")
-    if not SAFE.match(room) or not SAFE.match(identity):
+    if not SAFE.fullmatch(room) or not SAFE.fullmatch(identity):
         raise web.HTTPBadRequest(text="room/identity must match [A-Za-z0-9_-]{1,64}")
 
     at = (
@@ -50,10 +53,19 @@ async def token(request: web.Request) -> web.Response:
 RUNS = HERE.parent / "runs"
 
 
-def _run_dir(request: web.Request) -> Path:
-    run = request.match_info["run"]
+def _safe_run(run: str) -> Path | None:
+    """runs/<run> if the id is plain and the directory really lives under runs/ (no symlink escape)."""
+    if not SAFE.fullmatch(run):
+        return None
     d = RUNS / run
-    if not SAFE.match(run) or not d.is_dir():
+    if not d.is_dir() or RUNS.resolve() not in d.resolve().parents:
+        return None
+    return d
+
+
+def _run_dir(request: web.Request) -> Path:
+    d = _safe_run(request.match_info["run"])
+    if d is None:
         raise web.HTTPNotFound(text="no such run")
     return d
 
@@ -62,7 +74,9 @@ async def replay_events(request: web.Request) -> web.Response:
     """回放：返回 runs/<run>/events.jsonl（编排器领域事件）+ 音频对齐偏移。只读、只限 runs/ 下。"""
     import json
     d = _run_dir(request)
-    evs = [json.loads(l) for l in (d / "events.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+    if not (d / "events.jsonl").is_file():
+        raise web.HTTPNotFound(text="no events for this run")
+    evs = [json.loads(ln) for ln in (d / "events.jsonl").read_text(encoding="utf-8").splitlines() if ln.strip()]
     offset_ms = 0.0
     man = d / "audio" / "manifest.json"
     if man.exists():
@@ -82,13 +96,16 @@ async def replay_levels(request: web.Request) -> web.Response:
     t0 = json.loads(man.read_text()).get("meeting_t0_epoch_ms", 0)
     out: dict = {}
     for line in lv.read_text().splitlines():
-        x = json.loads(line); k = int((x["t_ms"] - t0) // 50)
-        if k < 0: continue
+        x = json.loads(line)
+        k = int((x["t_ms"] - t0) // 50)
+        if k < 0:
+            continue
         arr = out.setdefault(x["id"], {})
         arr[k] = max(arr.get(k, -120.0), x["db"])
     tracks = {}
     for ident, m in out.items():
-        n = max(m) + 1; tracks[ident] = [round(m.get(i, -120.0), 1) for i in range(n)]
+        n = max(m) + 1
+        tracks[ident] = [round(m.get(i, -120.0), 1) for i in range(n)]
     return web.json_response({"step_ms": 50, "tracks": tracks})
 
 
@@ -103,11 +120,15 @@ async def replay_minutes(request: web.Request) -> web.Response:
 
 
 async def replay_audio(request: web.Request) -> web.FileResponse:
-    return web.FileResponse(_run_dir(request) / "audio" / "mix.wav")
+    f = _run_dir(request) / "audio" / "mix.wav"
+    if not f.is_file():
+        raise web.HTTPNotFound(text="no audio for this run")
+    return web.FileResponse(f)
 
 
 async def replay_list(_: web.Request) -> web.Response:
-    runs = sorted(p.name for p in RUNS.iterdir() if p.is_dir() and (p / "events.jsonl").exists()) if RUNS.is_dir() else []
+    runs = sorted(p.name for p in RUNS.iterdir()
+                  if _safe_run(p.name) and (p / "events.jsonl").exists()) if RUNS.is_dir() else []
     return web.json_response({"runs": runs})
 
 
@@ -124,17 +145,34 @@ async def health(_: web.Request) -> web.Response:
 ACCESS_KEY = os.environ.get("MEETING_ACCESS_KEY", "")  # 设了即「公网模式」
 
 
+def _candidate_keys(request: web.Request) -> list[tuple[str, str]]:
+    """口令的出示方式，按推荐程度排序：Authorization: Bearer 头 > cookie `mk` > ?k=（旧链接，不推荐：
+    查询串会留在地址栏、浏览器历史和上游代理日志里）。"""
+    out = []
+    auth = request.headers.get("Authorization", "")
+    if auth[:7].lower() == "bearer " and auth[7:].strip():
+        out.append((auth[7:].strip(), "header"))
+    if request.cookies.get("mk"):
+        out.append((request.cookies["mk"], "cookie"))
+    if request.query.get("k"):
+        out.append((request.query["k"], "query"))
+    return out
+
+
 @web.middleware
 async def access_guard(request: web.Request, handler):
-    """公网模式（经隧道对外）：除 /healthz 外都要口令；口令可走 ?k= 或首访后下发的 HttpOnly cookie。
-    公网模式下关闭 /api/replay，token 只签给 MEETING_HUMAN_IDENTITY，房间可锁定为 MEETING_ROOM。"""
+    """公网模式（经隧道对外）：除 /healthz 外都要口令；口令走 `Authorization: Bearer <key>` 头，
+    或首访后下发的 HttpOnly cookie；旧的 `?k=<key>` 仍可用（不推荐），用过一次就换成 cookie。
+    公网模式下关闭 /api/replay，token 只签给 MEETING_HUMAN_IDENTITY，房间可锁定为 MEETING_ROOM。
+    口令不进日志：访问日志只记路径（见 PathOnlyAccessLogger），错误文本不回显口令。"""
     import hmac
     if not ACCESS_KEY or request.path == "/healthz":
         return await handler(request)
     if request.path.startswith("/api/replay"):
         raise web.HTTPNotFound()
-    got = request.query.get("k") or request.cookies.get("mk", "")
-    if not hmac.compare_digest(got.encode(), ACCESS_KEY.encode()):
+    via = next((how for got, how in _candidate_keys(request)
+                if hmac.compare_digest(got.encode(), ACCESS_KEY.encode())), None)
+    if via is None:
         raise web.HTTPForbidden(text="forbidden")
     if request.path == "/api/token":
         human = os.environ.get("MEETING_HUMAN_IDENTITY", "host")
@@ -144,7 +182,7 @@ async def access_guard(request: web.Request, handler):
         if locked and request.query.get("room") != locked:
             raise web.HTTPForbidden(text="room locked")
     resp = await handler(request)
-    if request.query.get("k"):
+    if via == "query" and request.method in ("GET", "HEAD"):
         resp.set_cookie("mk", ACCESS_KEY, httponly=True, secure=True, samesite="Strict", max_age=6 * 3600)
     return resp
 
@@ -160,6 +198,17 @@ def make_app() -> web.Application:
     return app
 
 
+class PathOnlyAccessLogger(AccessLogger):
+    """默认访问日志记 `request.path_qs`，`?k=<口令>` 会原样落进日志文件；这里只记路径。"""
+
+    def log(self, request, response, time):
+        try:
+            self.logger.info('%s "%s %s" %s %s %.3fs', request.remote or "-", request.method, request.path,
+                             response.status, response.body_length, time)
+        except Exception:
+            self.logger.exception("Error in logging")
+
+
 if __name__ == "__main__":
     web.run_app(make_app(), host=os.environ.get("WEB_HOST", "127.0.0.1"),
-                port=int(os.environ.get("WEB_PORT", "8787")))
+                port=int(os.environ.get("WEB_PORT", "8787")), access_log_class=PathOnlyAccessLogger)

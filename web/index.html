@@ -3,6 +3,24 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="referrer" content="no-referrer">
+<script>
+/* 加入链接把 liveKitUrl/token 放在 URL fragment（#...）里：浏览器不会把 fragment 发给服务器，
+ * 静态托管（GitHub Pages）的日志和 Referer 里都看不到 token。旧链接的 ?token= 仍然可读。
+ * 读完立刻从地址栏抹掉，避免进历史记录、被截图或复制转发。放在经典 script 里，不等模块的 CDN 加载。 */
+window.__join = (function () {
+  var h = new URLSearchParams(location.hash.replace(/^#/, ""));
+  var q = new URLSearchParams(location.search);
+  var pick = function (k) { return h.get(k) || q.get(k) || ""; };
+  var j = { url: pick("liveKitUrl") || pick("url"), token: pick("token") };
+  if (h.has("token") || h.has("liveKitUrl") || q.has("token")) {
+    q.delete("token"); h.delete("token"); h.delete("liveKitUrl"); h.delete("url");
+    var qs = q.toString(), hs = h.toString();
+    try { history.replaceState(null, "", location.pathname + (qs ? "?" + qs : "") + (hs ? "#" + hs : "")); } catch (e) {}
+  }
+  return j;
+})();
+</script>
 <title>多 Bot 语音会议</title>
 <style>
 :root { --bg:#0f1115; --panel:#171a21; --line:#262b36; --text:#e7e9ee; --dim:#8a93a6; --accent:#4ade80; --warn:#fbbf24; --red:#f87171; --blue:#60a5fa; }
@@ -67,8 +85,14 @@ main { display:grid; grid-template-columns: 1fr 340px; gap:16px; padding:16px 20
 .act { padding:6px 0; border-bottom:1px dashed var(--line); }
 #replaybar { display:none; align-items:center; gap:10px; }
 #replaybar input { width:220px; }
+#ctl { margin-top:12px; padding-top:10px; border-top:1px dashed var(--line); display:flex; flex-direction:column; gap:8px; }
+#ctl .row { display:flex; gap:6px; }
+#ctl input, #ctl select { flex:1; min-width:0; background:#11141a; color:var(--text); border:1px solid #333a4a; border-radius:8px; padding:6px 10px; font-size:13px; }
+#ctl input:disabled, #ctl select:disabled { opacity:.4; }
+#ctl button { padding:6px 10px; font-size:13px; flex:none; }
 .cmt { font-size:13px; padding:5px 0; border-bottom:1px dashed var(--line); }
 .cmt:last-child { border:0 }
+a { color:var(--blue); }
 </style>
 </head>
 <body>
@@ -87,13 +111,19 @@ main { display:grid; grid-template-columns: 1fr 340px; gap:16px; padding:16px 20
 </header>
 <main>
   <div class="col">
+    <div class="panel" id="runs" style="display:none"><h2>回放</h2><div id="runlist"></div></div>
     <div class="panel"><h2>参会者</h2><div id="grid"></div></div>
     <div class="panel" style="flex:1;display:flex;flex-direction:column;min-height:0">
       <h2>实时字幕</h2><div id="captions"></div>
     </div>
   </div>
   <div class="col" style="overflow:auto">
-    <div class="panel"><h2>议程</h2><div id="agenda"><div class="empty">等待会议开始</div></div></div>
+    <div class="panel"><h2>议程</h2><div id="agenda"><div class="empty">等待会议开始</div></div>
+      <div id="ctl">
+        <div class="row"><input id="ag-title" maxlength="80" placeholder="新议程标题" disabled><button id="ag-add" disabled>加议程</button></div>
+        <div class="row"><button id="ag-next" disabled title="现在结束当前议程项，进入下一项">下一项</button><button id="ag-rename" disabled title="给当前议程项改名">改名</button></div>
+        <div class="row"><select id="bot-sel" disabled><option value="">加入 bot…</option></select><button id="bot-add" disabled>加入</button></div>
+      </div></div>
     <div class="panel"><h2>举手队列</h2><div id="hands"><div class="empty">暂无</div></div></div>
     <div class="panel"><h2>问本体（慢路径）</h2><div id="principal"><div class="empty">暂无</div></div></div>
     <div class="panel"><h2>当场承诺 / 决策</h2><div id="commits"><div class="empty">暂无</div></div></div>
@@ -102,7 +132,8 @@ main { display:grid; grid-template-columns: 1fr 340px; gap:16px; padding:16px 20
 <div id="minutes"><button class="close" id="minclose">关闭</button><h3>会后纪要</h3><div id="minbody"></div></div>
 
 <script type="module">
-import { Room, RoomEvent, Track } from "https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.esm.mjs";
+// 精确版本，不跟浮动的 @2。ES module 的 import 不支持 SRI integrity；升级时手动改这里并回归一次入会。
+import { Room, RoomEvent, Track } from "https://cdn.jsdelivr.net/npm/livekit-client@2.22.4/dist/livekit-client.esm.mjs";
 
 /* 数据约定（编排器 -> 网页）
  *  meeting.events  : 编排器领域事件原样转发，与 runs/<run>/events.jsonl 每行同构 {type, at, seq, data}
@@ -111,17 +142,20 @@ import { Room, RoomEvent, Track } from "https://cdn.jsdelivr.net/npm/livekit-cli
  *  meeting.level   : 语音层推送 {"type":"level",participant_id,dbfs,t_ms} ~10Hz / {"type":"speaking",participant_id,speaking,t_ms}；人类 id 为房间身份
  *  meeting.minutes : {"markdown": "...", "actions": {"<bot_id>": [ {title, owner_id, status, ...} ]}}
  * 网页 -> 编排器
- *  meeting.control : {"action":"interrupt"|"end"}（编排器只接受 MEETING_HUMAN_IDENTITY 发来的）
+ *  meeting.control : {"action":"interrupt"|"end"|"agenda_next"} / {"action":"agenda_add","title"} /
+ *                    {"action":"agenda_rename","title","item_id"} / {"action":"bot_add","bot_id"}
+ *                    （编排器只接受 MEETING_HUMAN_IDENTITY 发来的；字段在 worker 再校验一遍）
  * 回放：?replay=<run> 读 /api/replay/<run>/events 和 mix.wav，按事件的 at 与音频同步。 */
 const params = new URLSearchParams(location.search);
 const roomName = params.get("room") || "meeting-dev";
 const replayRun = params.get("replay");
 let identity = params.get("identity") || "";
 // Pre-signed join (GitHub Pages or any static host). No token server required.
-const presetUrl = params.get("liveKitUrl") || params.get("url") || "";
-const presetToken = params.get("token") || "";
+// 已由 <head> 里的脚本读出并从地址栏抹掉（fragment 优先，兼容旧的 ?token=）。
+const presetUrl = window.__join.url;
+const presetToken = window.__join.token;
 const $ = (id) => document.getElementById(id);
-const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const fmt = (ms) => { const s = Math.max(0, Math.floor(ms / 1000)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; };
 const COLORS = ["#4ade80", "#60a5fa", "#f472b6", "#fbbf24", "#a78bfa", "#34d399", "#fb923c"];
 
@@ -129,7 +163,7 @@ const COLORS = ["#4ade80", "#60a5fa", "#f472b6", "#fbbf24", "#a78bfa", "#34d399"
 const S = {
   humanId: identity || "host", names: {}, order: [], agenda: [], curItem: null, itemStart: {}, closed: new Set(),
   speaker: null, speakerState: "idle", hands: new Map(), queries: new Map(), commits: [], decisions: [],
-  phase: "未开始", now: 0, ended: false, minutes: null, moderator: null,
+  phase: "未开始", now: 0, ended: false, minutes: null, moderator: null, addable: [], adding: new Set(),
 };
 const tiles = new Map();
 function name(id) { return S.names[id] || id; }
@@ -137,7 +171,7 @@ function ensureTile(id) {
   if (!id || tiles.has(id)) return tiles.get(id);
   const i = tiles.size, c = COLORS[i % COLORS.length];
   const el = document.createElement("div"); el.className = "tile";
-  el.innerHTML = `<span class="hand">✋</span><div class="av" style="background:${c}">${esc(name(id)).slice(0, 1)}</div>
+  el.innerHTML = `<span class="hand">✋</span><div class="av" style="background:${c}"></div>
     <div class="nm"></div><div class="tag"></div><canvas width="300" height="56"></canvas>`;
   $("grid").appendChild(el);
   const t = { el, color: c, canvas: el.querySelector("canvas"), level: 0, hist: new Array(60).fill(0) };
@@ -218,7 +252,7 @@ function apply(ev) {
   const d = ev.data || {}, at = ev.at ?? S.now; S.now = Math.max(S.now, at);
   switch (ev.type) {
     case "MeetingCreated": {
-      const p = d.payload || {}; S.agenda = p.agenda || []; S.moderator = p.moderator?.participant_id || null;
+      const p = d.payload || {}; S.agenda = (p.agenda || []).slice(); S.moderator = p.moderator?.participant_id || null;
       if (p.linked_human_id) S.humanId = p.linked_human_id;
       if (p.title) $("title").textContent = p.title;
       break;
@@ -229,6 +263,16 @@ function apply(ev) {
       if (p.speaker_id) { S.names[p.speaker_id] = p.display_name || S.names[p.speaker_id]; ensureTile(p.speaker_id); S.speaker = p.speaker_id; S.speakerState = p.state || "idle"; }
       break;
     }
+    case "AgendaItemAdded": if (d.agenda_item && !S.agenda.some((a) => a.id === d.agenda_item.id)) S.agenda.push(d.agenda_item);
+      sysline(`新增议程：${d.agenda_item?.title ?? ""}`, "dir"); break;
+    case "AgendaItemRenamed": { const a = S.agenda.find((x) => x.id === d.agenda_item_id); if (a) a.title = d.title;
+      sysline(`议程改名：${d.old_title ?? ""} → ${d.title ?? ""}`, "dir"); break; }
+    case "AddableBots": S.addable = Array.isArray(d.bots) ? d.bots : []; renderControls(); break;
+    case "BotAdding": S.adding.add(d.bot_id); sysline(`正在请 ${d.display_name || d.bot_id} 入会…`, "dir"); renderControls(); break;
+    case "BotJoined": { const p = d.participant || {}; S.names[p.id] = p.display_name || p.id; ensureTile(p.id);
+      S.adding.delete(p.id); sysline(`${name(p.id)} 加入了会议`, "dir"); renderControls(); break; }
+    case "ControlRejected": if (d.bot_id) S.adding.delete(d.bot_id);
+      sysline(`操作未执行：${REJECT[d.reason] || d.reason}`, "end"); renderControls(); break;
     case "PhaseChanged": if (d.layer === "phase" || !d.layer) S.phase = PHASE[d.to] || d.to; break;
     case "AgendaItemStarted": S.curItem = d.agenda_item_id; S.itemStart[d.agenda_item_id] = at; break;
     case "AgendaItemClosed": S.closed.add(d.agenda_item_id); S.itemStart[d.agenda_item_id + ":end"] = at; break;
@@ -261,12 +305,17 @@ function apply(ev) {
     case "MeetingEnded": S.ended = true; S.phase = "已结束"; sysline("会议结束", "end"); onEnded(); break;
   }
 }
+const REJECT = { invalid: "输入不合法", unknown_action: "未知操作", not_in_agenda: "现在不在讨论中", last_item: "已经是最后一项，请用「结束会议」",
+  too_many: "议程项太多了", stale_item: "当前议程项已经变了，请重试", unknown_bot: "注册表里没有这个 bot", already_in_meeting: "这个 bot 已经在会上",
+  already_adding: "这个 bot 正在加入", busy: "同时加入的 bot 太多，请稍候", too_many_bots: "会上的 bot 已达上限", unsupported: "本场不支持会中加 bot",
+  no_voice: "没有空闲音色了", context_unreadable: "读不到这个 bot 的 context", brief_failed: "生成 brief 失败", timeout: "准备超时",
+  connect_failed: "连接语音失败", internal: "内部错误" };
 const PHASE = { Inviting: "邀请中", Preparing: "会前准备", OpeningSync: "开场同步", InAgenda: "讨论中", Deciding: "形成决策", Closing: "收尾", PostMeeting: "会后", Ended: "已结束" };
 
 /* ---------------- 纪要 ---------------- */
 async function onEnded() {
-  $("showmin").disabled = false;
-  if (replayRun && !S.minutes) S.minutes = await (await fetch(`/api/replay/${replayRun}/minutes`)).json();
+  $("showmin").disabled = false; renderControls();
+  if (replayRun && !S.minutes) S.minutes = await (await fetch(`/api/replay/${encodeURIComponent(replayRun)}/minutes`)).json();
   if (S.minutes) showMinutes();
 }
 function showMinutes() {
@@ -326,13 +375,46 @@ function tick() {
 requestAnimationFrame(tick);
 
 /* ---------------- 实时模式 ---------------- */
-let room;
-function setLive(on) { $("mute").disabled = $("leave").disabled = $("interrupt").disabled = $("end").disabled = !on; $("join").disabled = on; }
-async function control(action) {
-  if (!room) return;
-  await room.localParticipant.publishData(new TextEncoder().encode(JSON.stringify({ action })), { reliable: true, topic: "meeting.control" });
-  sysline(action === "end" ? "你发出了：结束会议" : "你发出了：打断", "dir");
+let room, live = false;
+function setLive(on) { live = on; $("mute").disabled = $("leave").disabled = $("interrupt").disabled = $("end").disabled = !on; $("join").disabled = on; renderControls(); }
+/* 会中控制：回放、未连接、会议已结束时全部禁用；加 bot 的下拉只列 worker 发布的 {id, display_name}（不含 context） */
+function renderControls() {
+  const on = live && !replayRun && !S.ended;
+  for (const id of ["ag-title", "ag-add", "ag-next", "ag-rename"]) $(id).disabled = !on;
+  const sel = $("bot-sel"), cur = sel.value, busy = S.adding.size > 0;
+  sel.replaceChildren(new Option(S.addable.length ? "加入 bot…" : "没有可加入的 bot", ""), ...S.addable.map((b) => new Option(b.display_name || b.id, b.id)));
+  if (S.addable.some((b) => b.id === cur)) sel.value = cur;
+  sel.disabled = !on || !S.addable.length || busy;
+  $("bot-add").disabled = !on || !S.addable.length || busy;
+  $("bot-add").textContent = busy ? "加入中…" : "加入";
 }
+async function sendControl(msg) {
+  if (!room || !live || replayRun || S.ended) return false;
+  try { await room.localParticipant.publishData(new TextEncoder().encode(JSON.stringify(msg)), { reliable: true, topic: "meeting.control" }); return true; }
+  catch (e) { sysline("控制消息发送失败：" + (e.message || e), "end"); return false; }
+}
+const control = async (action) => {
+  if (await sendControl({ action })) sysline(action === "end" ? "你发出了：结束会议" : action === "agenda_next" ? "你发出了：下一项" : "你发出了：打断", "dir");
+};
+$("ag-add").onclick = async () => {
+  const title = $("ag-title").value.trim(); if (!title) return;
+  if (await sendControl({ action: "agenda_add", title })) $("ag-title").value = "";
+};
+$("ag-title").onkeydown = (e) => { if (e.key === "Enter" && !e.isComposing) $("ag-add").click(); };
+$("ag-next").onclick = () => { if (confirm("现在结束当前议程项，进入下一项？")) control("agenda_next"); };
+$("ag-rename").onclick = async () => {
+  const cur = S.agenda.find((a) => a.id === S.curItem); if (!cur) return;
+  const title = (prompt("当前议程项改名为：", cur.title) || "").trim();
+  if (title && title !== cur.title) await sendControl({ action: "agenda_rename", title, item_id: cur.id });
+};
+$("bot-add").onclick = async () => {
+  const id = $("bot-sel").value; if (!id) return;
+  if (await sendControl({ action: "bot_add", bot_id: id })) {
+    S.adding.add(id); renderControls();
+    setTimeout(() => { if (S.adding.delete(id)) renderControls(); }, 60000); // 兜底：60s 没等到结果就放开按钮
+  }
+};
+renderControls();
 $("interrupt").onclick = () => control("interrupt");
 $("end").onclick = () => { if (confirm("确定结束会议？")) control("end"); };
 
@@ -390,21 +472,33 @@ $("mute").onclick = async () => { const on = room.localParticipant.isMicrophoneE
 $("leave").onclick = () => room?.disconnect();
 if (presetUrl && presetToken && !replayRun) $("status").textContent = "链接已带 token，点击加入";
 
+/* ---------------- 回放入口：本地 token_server 才有 /api/replay；静态托管上 404，面板保持隐藏 ---------------- */
+if (!replayRun && !presetToken) (async () => {
+  try {
+    const r = await fetch("/api/replay");
+    if (!r.ok) return;
+    const runs = ((await r.json()).runs || []).filter((x) => typeof x === "string").reverse();
+    if (!runs.length) return;
+    $("runlist").innerHTML = runs.map((x) => `<div class="q"><a href="?replay=${encodeURIComponent(x)}">${esc(x)}</a></div>`).join("");
+    $("runs").style.display = "";
+  } catch {}
+})();
+
 /* ---------------- 回放模式 ---------------- */
 if (replayRun) (async () => {
-  $("join").style.display = "none"; $("replaybar").style.display = "flex"; $("status").textContent = `回放 ${replayRun}（打断/结束按钮仅实时会议可用）`;
-  const j = await (await fetch(`/api/replay/${replayRun}/events`)).json();
-  RL = await (await fetch(`/api/replay/${replayRun}/levels`)).json();
+  $("join").style.display = "none"; $("ctl").style.display = "none"; $("replaybar").style.display = "flex"; $("status").textContent = `回放 ${replayRun}（打断/结束按钮仅实时会议可用）`;
+  const j = await (await fetch(`/api/replay/${encodeURIComponent(replayRun)}/events`)).json();
+  RL = await (await fetch(`/api/replay/${encodeURIComponent(replayRun)}/levels`)).json();
   const evs = j.events.sort((a, b) => a.seq - b.seq); const off = j.audio_offset_ms || 0;
   for (const e of evs) {
     if (e.type === "FloorGranted") TL.push([e.at, e.data.token.holder_id]);
     else if (e.type === "FloorReleased" || e.type === "FloorRevoked") TL.push([e.at + 300, null]);
   }
   const endAt = evs.length ? evs[evs.length - 1].at : 0;
-  const audio = new Audio(`/api/replay/${replayRun}/audio`); audio.preload = "auto"; audio.crossOrigin = "anonymous";
+  const audio = new Audio(`/api/replay/${encodeURIComponent(replayRun)}/audio`); audio.preload = "auto"; audio.crossOrigin = "anonymous";
   let srcNode; let idx = 0;
   const startAt = Number(params.get("t") || 0) * 1000;
-  function reset() { Object.assign(S, { names: {}, agenda: [], curItem: null, itemStart: {}, closed: new Set(), speaker: null, speakerState: "idle", hands: new Map(), queries: new Map(), commits: [], decisions: [], ended: false, now: 0 });
+  function reset() { Object.assign(S, { names: {}, agenda: [], curItem: null, itemStart: {}, closed: new Set(), speaker: null, speakerState: "idle", hands: new Map(), queries: new Map(), commits: [], decisions: [], ended: false, now: 0, addable: [], adding: new Set() });
     $("captions").innerHTML = ""; $("grid").innerHTML = ""; tiles.clear(); idx = 0; }
   function advance(t) { if (t < S.now - 1) reset(); while (idx < evs.length && evs[idx].at <= t) apply(evs[idx++]); S.now = t; renderAll();
     $("rp-time").textContent = `${fmt(t)} / ${fmt(endAt)}`; $("rp-seek").value = Math.round((t / Math.max(1, endAt)) * 1000); }

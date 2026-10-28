@@ -158,14 +158,13 @@ def cmd_start(args: argparse.Namespace) -> int:
 
 def cmd_worker(args: argparse.Namespace) -> int:
     _load_env()
-    root = repo_root()
-    os.chdir(root)
-    sys.path.insert(0, str(root))
-    sys.path.insert(0, str(root / "voice"))
-    import main
+    home = os.environ.get("MEETING_HOME")
+    if home and Path(home).is_dir():
+        os.chdir(home)      # relative paths (runs/, links/) land in MEETING_HOME; otherwise the current dir
     from livekit.agents import cli
+    from meet.worker import server
     sys.argv = ["meet-worker", args.mode]
-    cli.run_app(main.server)
+    cli.run_app(server)
     return 0
 
 
@@ -206,7 +205,11 @@ def build_parser() -> argparse.ArgumentParser:
     demo.add_argument("--run-dir")
     demo.add_argument("--lines")
     follow = sub.add_parser("followup", help="write prompts so the real bots can confirm commitments")
-    follow.add_argument("run_dir")
+    from meet.followup import add_arguments as add_followup_arguments
+    add_followup_arguments(follow)
+    stats = sub.add_parser("stats", help="latency percentiles and reliability counts for finished runs")
+    from meet.stats import add_arguments as add_stats_arguments
+    add_stats_arguments(stats)
     return ap
 
 
@@ -228,8 +231,11 @@ def main(argv=None) -> int:
     if args.cmd == "demo":
         return cmd_demo(args)
     if args.cmd == "followup":
-        from meet.followup import main as follow_main
-        return follow_main([args.run_dir])
+        from meet.followup import run as follow_run
+        return follow_run(args)
+    if args.cmd == "stats":
+        from meet.stats import run as stats_run
+        return stats_run(args)
     if args.who or args.topic:
         return cmd_start(args)
     ap.print_help()

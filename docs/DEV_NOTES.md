@@ -3,6 +3,8 @@
 > 历史设计笔记。当前的安装、`meet` 命令和提供者说明在仓库根目录的 README.md / README.zh-CN.md。
 > 示例场景里的 Chief of Staff 只是样例数据。新产品路径的默认主持人是中立的 `moderator`。
 
+> 后来的变化（以代码和 README 为准）：LiveKit 入口已搬到 `meet/worker.py`，`main.py` 只是转发的 shim；真实会议里由 LLM 规划器（`orchestrator/planner.py`）决定发言内容，`fake_llm.py` 退为兜底；真实会议（`meet` 的场景）的本体问题默认 `defer`（只记入纪要），`mock` 只留给样例场景；运行目录 id 默认 `<room>-<时间戳>`；入会链接把 token 放在 URL fragment。运维命令见 [OPERATIONS.md](OPERATIONS.md)。
+
 设计依据：v0.2 设计页（单 AgentSession + 编排器令牌 `update_agent` 切换）。
 
 ## 目录分工
@@ -38,8 +40,8 @@ python main.py dev                        # LiveKit agent（出站连 LiveKit Cl
 | `DEEPSEEK_API_KEY` | DeepSeek（OpenAI 兼容）；缺省时自动用 mock |
 | `DEEPSEEK_MODEL` | 模型名，默认 `deepseek-flash`（官方文档 2026-10-27）；当前 .env 配的是 `deepseek-chat` |
 | `DEEPSEEK_BASE_URL` | 默认 `https://api.deepseek.com` |
-| `MEETING_SCENARIO` | `example`（默认）或 `sim_v1` |
-| `MEETING_RUN_ID` | 产物目录 `runs/<run_id>/`，默认按启动时间生成 |
+| `MEETING_SCENARIO` | 样例场景 `example` 或 `sim_v1`；worker 在 job 没带场景时默认 `sim_v1` |
+| `MEETING_RUN_ID` | 产物目录 `runs/<run_id>/`，默认 `<room>-<YYYYmmdd-HHMMSS>`；设了就原样使用 |
 | `MEETING_HUMAN_IDENTITY` | 用户的 LiveKit identity，默认 `host`；= `linked_human_id` = RoomIO `participant_identity` |
 
 ## 给 web/ 的数据约定（LiveKit data message，JSON，reliable 通道）
@@ -63,8 +65,8 @@ python main.py dev                        # LiveKit agent（出站连 LiveKit Cl
 ## 编排器模块
 
 `models.py` 数据结构 · `events.py` 事件日志（append-only、JSONL、`project()` 回放）· `state_machine.py` 状态机（非法转移抛错）·
-`scheduler.py` 优先级/举手打分/冷却/防 bot 链/插回配额 · `orchestrator.py` 单线程事件循环 · `principal.py` 本体慢路径（模拟）·
-`fake_llm.py` 测试用 LLM · `llm.py` DeepSeek 适配 · `bots/` 示例会议与 brief（全部虚构）· `sim.py` 文本模拟器 · `tests/` 单测
+`scheduler.py` 优先级/举手打分/冷却/防 bot 链/插回配额 · `orchestrator.py` 单线程事件循环 · `principal.py` 本体慢路径（`defer` / `mock` / `file` / `webhook`）·
+`fake_llm.py` 规则台词（测试与 LLM 兜底）· `llm.py` DeepSeek 适配 · `bots/` 示例会议与 brief（全部虚构）· `sim.py` 文本模拟器 · `tests/` 单测
 
 ## v1 验收（sim_v1 场景）
 
