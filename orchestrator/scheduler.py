@@ -245,7 +245,7 @@ class Scheduler:
     def on_agenda_changed(self) -> None:
         self.s.reinserted = {}
         self.s.bot_chain = 0
-        self.s.cues = [c for c in self.s.cues if c.intent in ("recap", "directive")]
+        self.s.cues = [c for c in self.s.cues if c.intent in ("recap", "directive", "bot_joined")]   # 新人入会的介绍跨议程保留
 
     def recent_share(self, pid: ID, agenda_item_id: ID) -> float:
         per = self.s.talk_ms.get(agenda_item_id, {})

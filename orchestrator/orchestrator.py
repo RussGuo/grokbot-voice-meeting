@@ -976,14 +976,14 @@ class Orchestrator:
         instr = i18n_turn(lang, intent)
         brief_text, snaps_text = "", {}
         if brief:
-            brief_text, cut, full_len = compact_brief(brief.to_dict())
+            brief_text, cut, full_len = compact_brief(brief.to_dict(), language=lang)
             if cut:
                 log.warning("brief 超长被截断：%s %d→%d 字", pid, full_len, len(brief_text))
                 self.emit("ContextTruncated", participant_id=pid, part="brief", full=full_len, kept=len(brief_text))
         for bid, b in self.briefs.items():
             if bid == pid:
                 continue                      # 自己的快照已在 brief 的「关键数字」里
-            t, cut = compact_snapshot(b.memory_snapshot.to_dict())
+            t, cut = compact_snapshot(b.memory_snapshot.to_dict(), language=lang)
             snaps_text[bid] = t
             if cut:
                 self.emit("ContextTruncated", participant_id=pid, part=f"snapshot:{bid}", full=-1, kept=len(t))
@@ -991,7 +991,7 @@ class Orchestrator:
                              brief=brief.to_dict() if brief else None, topic_snapshots=snapshots,
                              shared_minutes=self.minutes[-self.rules.minutes_window:],
                              max_turns=self.rules.minutes_window, turn_instruction=instr, turn_meta=meta,
-                             brief_text=brief_text, snapshots_text=snaps_text)
+                             brief_text=brief_text, snapshots_text=snaps_text, language=lang)
 
     async def _switch_and_grant(self, c: Candidate) -> None:
         pid = c.participant_id

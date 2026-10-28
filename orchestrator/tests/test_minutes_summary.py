@@ -310,3 +310,11 @@ def test_zh_minutes_keep_legacy_headings():
               "## 会后补充（本体答案未在会上送达）"):
         assert h in md
     assert "示例" not in md.split("## 决策")[1].split("## 发言记录")[0]
+
+
+def test_english_meeting_prompt_has_no_cjk_labels():
+    """英文会议组装给 LLM 的上下文：标签、brief 小标题、快照都跟会议语言走（参会方内容本身不算）。"""
+    d = EnDriver()
+    msgs = d.orch.assemble_chat_ctx("eng", "answer", {}).to_messages()
+    text = "\n".join(m["content"] for m in msgs)
+    assert not CJK.search(text), [ln for ln in text.splitlines() if CJK.search(ln)]
