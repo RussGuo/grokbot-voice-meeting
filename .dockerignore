@@ -1,0 +1,13 @@
+.git
+.venv
+venv
+runs
+links
+**/.env
+**/__pycache__
+**/.pytest_cache
+**/*.pyc
+models
+voice/models
+*.wav
+*.mp3

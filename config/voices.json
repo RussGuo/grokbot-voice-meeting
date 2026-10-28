@@ -1,0 +1,38 @@
+{
+  "sim_human": "zh_male_taocheng_uranus_bigtts",
+  "pool": [
+    {"id": "zh_female_vv_uranus_bigtts", "gender": "F", "label": "Vivi"},
+    {"id": "zh_male_m191_uranus_bigtts", "gender": "M", "label": "Yunzhou"},
+    {"id": "zh_female_qingxinnvsheng_uranus_bigtts", "gender": "F", "label": "Qingxin"},
+    {"id": "zh_male_huolixiaoge_uranus_bigtts", "gender": "M", "label": "Huoli"},
+    {"id": "zh_female_xiaohe_uranus_bigtts", "gender": "F", "label": "Xiaohe"},
+    {"id": "zh_male_ruyayichen_uranus_bigtts", "gender": "M", "label": "Ruya"},
+    {"id": "zh_female_shuangkuaisisi_uranus_bigtts", "gender": "F", "label": "Sisi"},
+    {"id": "zh_male_taocheng_uranus_bigtts", "gender": "M", "label": "Taocheng"}
+  ],
+  "bots": {
+    "moderator": {"local_sid": 50, "volc_speaker": "zh_male_huolixiaoge_uranus_bigtts", "aliyun_voice": "longxiaochun_v3", "openai_voice": "onyx"},
+    "pm_bot": {"local_sid": 47, "volc_speaker": "zh_female_qingxinnvsheng_uranus_bigtts", "aliyun_voice": "longxiaochun_v3", "openai_voice": "nova"},
+    "eng_bot": {"local_sid": 49, "volc_speaker": "zh_male_m191_uranus_bigtts", "aliyun_voice": "longxiaochun_v3", "openai_voice": "echo"},
+    "bot_c": {"local_sid": 48, "volc_speaker": "zh_female_vv_uranus_bigtts", "aliyun_voice": "longxiaochun_v3", "openai_voice": "shimmer"},
+    "bot_e": {"local_sid": 45, "volc_speaker": "zh_female_xiaohe_uranus_bigtts", "aliyun_voice": "longxiaochun_v3", "openai_voice": "alloy"},
+    "bot_f": {"local_sid": 51, "volc_speaker": "zh_male_taocheng_uranus_bigtts", "aliyun_voice": "longxiaochun_v3", "openai_voice": "fable"},
+    "bot_g": {"local_sid": 52, "volc_speaker": "zh_female_shuangkuaisisi_uranus_bigtts", "aliyun_voice": "longxiaochun_v3", "openai_voice": "nova"},
+    "voice_ruyayichen": {"local_sid": 51, "volc_speaker": "zh_male_ruyayichen_uranus_bigtts", "aliyun_voice": "longxiaochun_v3", "openai_voice": "onyx"},
+    "voice_shuangkuaisisi": {"local_sid": 52, "volc_speaker": "zh_female_shuangkuaisisi_uranus_bigtts", "aliyun_voice": "longxiaochun_v3", "openai_voice": "shimmer"},
+    "sim_human": {"local_sid": 46, "volc_speaker": "zh_male_taocheng_uranus_bigtts", "aliyun_voice": "longxiaochun_v3", "openai_voice": "echo"}
+  },
+  "aliases": {
+    "voice_moderator_neutral": "moderator",
+    "voice_pm_female_warm": "pm_bot",
+    "voice_eng_male_calm": "eng_bot",
+    "voice_cos_female_crisp": "bot_c",
+    "voice_sim_human": "sim_human",
+    "voice_slot_e": "bot_e",
+    "voice_slot_f": "bot_f",
+    "voice_slot_g": "bot_g",
+    "voice_growth_male_bright": "moderator",
+    "growth_bot": "moderator",
+    "chief_of_staff": "bot_c"
+  }
+}

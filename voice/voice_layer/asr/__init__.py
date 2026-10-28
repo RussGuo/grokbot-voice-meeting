@@ -23,5 +23,8 @@ def make_stt(cfg: VoiceConfig, provider: Optional[str] = None) -> lk_stt.STT:
     if p == "aliyun":
         from .aliyun import AliyunParaformerSTT
         return AliyunParaformerSTT()
+    if p == "openai":
+        from providers.openai_speech import make_openai_stt
+        return make_openai_stt(cfg)
     from .local_sherpa import SherpaStreamingSTT
     return SherpaStreamingSTT(models_dir=cfg.models_dir)

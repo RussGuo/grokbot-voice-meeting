@@ -1,5 +1,8 @@
 # voice-meeting：多 Bot 语音会议插件原型
 
+> 历史设计笔记。当前的安装、`meet` 命令和提供者说明在仓库根目录的 README.md / README.zh-CN.md。
+> 示例场景里的 Chief of Staff 只是样例数据。新产品路径的默认主持人是中立的 `moderator`。
+
 设计依据：v0.2 设计页（单 AgentSession + 编排器令牌 `update_agent` 切换）。
 
 ## 目录分工

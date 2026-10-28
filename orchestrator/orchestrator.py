@@ -18,7 +18,10 @@ import time
 from typing import Any, Callable, Optional
 
 from .brief_compact import compact_brief, compact_snapshot
+from .commitments import commitments_in_speech
 from .events import EventLog
+from .i18n import rules as i18n_rules
+from .i18n import turn as i18n_turn
 from .models import (
     ID, Brief, ChatCtxRecipe, Commitment, FloorToken, Meeting, Millis,
     PrincipalAnswer, PrincipalQuery, Utterance,
@@ -82,6 +85,8 @@ class Orchestrator:
         self.metrics: dict[str, list[float]] = {"switch_ms": [], "bargein_stop_ms": []}
         self._ducks: list[dict] = []
         self._vad_started_at: Millis = 0
+        self._directive_seen: set[str] = set()
+        self._transcript_after_eot = False
 
     # ———————————————————— 基础设施 ————————————————————
     def now(self) -> Millis:
@@ -134,7 +139,7 @@ class Orchestrator:
         """Inviting → Preparing → OpeningSync → InAgenda；发 roster；主持人开场。"""
         self.started_at = self.now()
         self.emit("MeetingCreated", payload={
-            "title": self.m.title, "initiator": self.m.initiator,
+            "title": self.m.title, "initiator": self.m.initiator, "language": getattr(self.m, "language", "zh"),
             "moderator": self.m.moderator.to_dict(), "linked_human_id": self.human_id,
             "agenda": [{"id": a.id, "title": a.title, "timebox_ms": a.timebox_ms} for a in self.m.agenda],
             "participants": [{"id": p.id, "kind": p.kind, "display_name": p.display_name, "role": p.role,
@@ -249,6 +254,7 @@ class Orchestrator:
         if ev.get("participant_id", self.human_id) != self.human_id:
             return      # RoomIO 只链接用户；其他来源一律忽略
         self.human_vad_active = True
+        self._transcript_after_eot = False
         self._vad_started_at = self.now()
         self.emit("HumanVad", stage="start", participant_id=self.human_id)
         self.sched.on_human_spoke()
@@ -321,8 +327,13 @@ class Orchestrator:
     async def _on_asr_final(self, ev):
         if ev.get("participant_id", self.human_id) != self.human_id or self.sm.phase != Phase.IN_AGENDA:
             return
-        if self.token is None and self.sm.can_floor(F.HUMAN_SPEAKING):
-            await self._grant_human()        # VAD 漏报时兜底
+        # 晚到的 final（eot 已经把话轮交还）不能再抢回发言权，否则点名指令会一直挂着。
+        # human_vad 仍开着，或这不是「刚说完」的补转写，才按 VAD 漏报兜底。
+        if (self.token is None and self.sm.can_floor(F.HUMAN_SPEAKING)
+                and not self._transcript_after_eot):
+            await self._grant_human()
+        if self._transcript_after_eot and not self.human_vad_active:
+            self._transcript_after_eot = False
         text = ev["text"]
         u = Utterance(id=f"utt-{next(self._utt_ids)}", speaker_id=self.human_id, agenda_item_id=self.agenda_id,
                       text=text, started_at=self._human_turn_start or self.now(), ended_at=self.now(),
@@ -330,20 +341,12 @@ class Orchestrator:
                       addressees=[p.id for p in self.m.participants if p.kind == "bot" and self.scorer.addressed(p.id, text)])
         self._append_utterance(u)
         self._silence_strikes = 0
-        target = parse_directive(text, {p.id: p.aliases + [p.display_name] for p in self.m.participants
-                                        if p.kind == "bot" and p.id != self.moderator_id})
-        if target:
-            did = f"dir-{next(self._q_ids)}"
-            self.emit("HumanDirective", stage="parsed", directive_id=did, target=target, text=text)
-            for h in self.sched.withdraw(target):
-                self.emit("HandWithdrawn", hand=h)
-            # 指令走主持人 cue 通道（优先级 60），高于普通举手；人类说完 EOT 后执行
-            self.sched.s.cues.insert(0, Cue(target, "directive", self.now(), note=text, ref_query_id=did))
-        if is_end_command(text):
+        await self._queue_directive(text)
+        if is_end_command(text, getattr(self.m, "language", "zh")):
             await self._human_end(text)
             return
         if self._end_confirm == "waiting":
-            if is_end_affirmation(text):
+            if is_end_affirmation(text, getattr(self.m, "language", "zh")):
                 self._end_confirmed = True
                 self.emit("EndConfirm", stage="confirmed", text=text)
             else:                                   # 用户还有话说：取消结束询问，继续讨论
@@ -395,14 +398,64 @@ class Orchestrator:
     async def _on_eot(self, ev):
         if ev.get("participant_id", self.human_id) != self.human_id:
             return
+        # LiveKit often commits the turn (eot) before the final transcript event.
+        # The turn message already carries the text; parse it here or the directive is skipped.
+        said = ev.get("text") or ""
+        if said:
+            await self._queue_directive(said)
         tok = self.token
         if tok and tok.holder_id == self.human_id and self.sm.floor == F.HUMAN_SPEAKING:
             self.emit("FloorReleased", token=tok)
             self.sched.on_turn_end(self.human_id, self.agenda_id, self._human_turn_start or self.now(), self.now())
             self.token = None
             self.sm.to_floor(F.FLOOR_IDLE)
+            self._transcript_after_eot = True
             await self._publish(self.human_id, "idle")
         await self.schedule()
+
+    def _directive_aliases(self) -> dict[str, list[str]]:
+        return _alias_map(self.m.participants, self.moderator_id)
+
+    async def _queue_directive(self, text: str) -> None:
+        """Record a spoken directive once, then run it if the floor is already free.
+
+        If the human still holds the floor, the following eot calls schedule().
+        If eot already ran and someone else was granted, preempt that turn:
+        the transcript arrived late, which is the usual barge-in race.
+        """
+        text = (text or "").strip()
+        if not text or self.sm.phase != Phase.IN_AGENDA:
+            return
+        target = parse_directive(text, self._directive_aliases())
+        if not target:
+            return
+        key = f"{target}:{text}"
+        if key in self._directive_seen:
+            return
+        self._directive_seen.add(key)
+        did = f"dir-{next(self._q_ids)}"
+        self.emit("HumanDirective", stage="parsed", directive_id=did, target=target, text=text)
+        for h in self.sched.withdraw(target):
+            self.emit("HandWithdrawn", hand=h)
+        self.sched.s.cues.insert(0, Cue(target, "directive", self.now(), note=text, ref_query_id=did))
+        await self._run_directive_if_floor_free()
+
+    async def _run_directive_if_floor_free(self) -> None:
+        if self.sm.phase != Phase.IN_AGENDA or self.human_vad_active or self.sm.floor == F.HUMAN_SPEAKING:
+            return
+        directive = next((c for c in self.sched.s.cues if c.intent == "directive"), None)
+        if directive is None:
+            return
+        tok = self.token
+        if tok and self.is_bot(tok.holder_id) and tok.intent != "directive" and directive.target != tok.holder_id:
+            if self.sm.floor in (F.PLAYING, F.SWITCHING, F.GRANTING, F.CUEING):
+                await self._revoke("directive")
+                if self.sm.floor != F.FLOOR_IDLE:
+                    self.sm.to_floor(F.FLOOR_IDLE)
+                await self.schedule()
+            return
+        if tok is None and self.sm.floor == F.FLOOR_IDLE:
+            await self.schedule()
 
     # —— bot 侧 ——
     def _stale(self, ev) -> bool:
@@ -434,7 +487,13 @@ class Orchestrator:
                       ended_at=self.now(), token_id=tok.id, provenance=ev.get("provenance"),
                       confidence=ev.get("confidence"), addressees=ev.get("addressees", []),
                       ducked=list(getattr(self, "_ducks", [])))
-        for text in self._guard_commitments(pid, ev.get("commitments", [])):
+        planned = [t for t in (ev.get("commitments") or []) if t]
+        spoken = commitments_in_speech(ev.get("text") or "", self.briefs[pid].mandate.can_commit if pid in self.briefs else [])
+        merged: list[str] = []
+        for text in planned + spoken:
+            if text not in merged:
+                merged.append(text)
+        for text in self._guard_commitments(pid, merged):
             c = Commitment(id=f"cmt-{next(self._c_ids)}", text=text, owner_id=pid, made_by=pid, utterance_id=u.id)
             u.commitments.append(c)
             self.commitments[c.id] = c
@@ -672,19 +731,15 @@ class Orchestrator:
     def assemble_chat_ctx(self, pid: ID, intent: str, meta: dict) -> ChatCtxRecipe:
         """update_agent 会清空历史，必须重组：brief + 共享主题快照 + 最近 8 条共享纪要。"""
         p = self.m.participant(pid)
-        rules_text = ("你在一场多 bot 语音会议里发言。口语化、简短（不超过 3 句）。"
-                      "只根据 brief 与快照回答，答不了就说“我问一下本体”。")
+        lang = getattr(self.m, "language", "zh")
+        rules_text = i18n_rules(lang)
         system = (p.agent_profile.instructions if p.agent_profile else "") + "\n" + rules_text
         brief = self.briefs.get(pid)
         snapshots = {bid: b.memory_snapshot.to_dict() for bid, b in self.briefs.items()}  # 决策 2：共享可见
         item = self.m.current_agenda
         last_text = self.utterances[-1].text if self.utterances else ""
         meta = {"intent": intent, "agenda_title": item.title if item else "", "agenda_item_id": item.id if item else "", "last_text": last_text, **meta}
-        instr = {
-            "answer": "回应刚才的发言。", "relay": "以“本体回复了”开头转述本体答案。",
-            "recap": "一句话回溯原议题，引出本体答案。", "fill_silence": "小结并邀请补充。",
-            "ask_human": "把话轮交给用户。", "confirm_end": "议程已完成，询问用户是否结束会议。", "open": "宣读议程与规则。", "open_item": "宣布进入下一议程项。",
-        }.get(intent, intent)
+        instr = i18n_turn(lang, intent)
         brief_text, snaps_text = "", {}
         if brief:
             brief_text, cut, full_len = compact_brief(brief.to_dict())
@@ -832,10 +887,24 @@ class Orchestrator:
 
 
 _DIRECTIVE_CUES = ("先让", "让", "请")
+_EN_DIRECTIVE_CUES = ("let ", "ask ", "have ")
+_EN_DIRECTIVE_VERBS = ("speak", "talk", "say", "go ahead", "start", "weigh in")
+
+
+def _alias_map(participants, moderator_id: str) -> dict[str, list[str]]:
+    return {p.id: p.aliases + [p.display_name] for p in participants
+            if p.kind == "bot" and p.id != moderator_id}
 
 
 def parse_directive(text: str, aliases: dict[str, list[str]]) -> Optional[str]:
-    """识别「停一下，先让工程说说成本」这类指令，返回目标 bot id。规则版，TODO：可换成小模型。"""
+    """Spot "先让工程说说成本" / "let Eng speak about cost". Returns the target bot id."""
+    zh = _parse_directive_zh(text, aliases)
+    if zh:
+        return zh
+    return _parse_directive_en(text, aliases)
+
+
+def _parse_directive_zh(text: str, aliases: dict[str, list[str]]) -> Optional[str]:
     for cue in _DIRECTIVE_CUES:
         i = text.find(cue)
         if i < 0:
@@ -854,25 +923,62 @@ def parse_directive(text: str, aliases: dict[str, list[str]]) -> Optional[str]:
     return None
 
 
+def _parse_directive_en(text: str, aliases: dict[str, list[str]]) -> Optional[str]:
+    low = text.lower()
+    for cue in _EN_DIRECTIVE_CUES:
+        i = low.find(cue)
+        if i < 0:
+            continue
+        rest_l = low[i + len(cue):]
+        if not any(v in rest_l for v in _EN_DIRECTIVE_VERBS):
+            continue
+        best = None
+        for pid, names in aliases.items():
+            for n in names:
+                if not n:
+                    continue
+                j = rest_l.find(n.lower())
+                if j >= 0 and (best is None or j < best[0]):
+                    best = (j, pid)
+        if best:
+            return best[1]
+    return None
+
+
 _AFFIRM = ("结束", "散会", "可以了", "就这样", "没有了", "没问题", "好的", "行")
+_AFFIRM_EN = ("yes", "we're done", "we are done", "sounds good", "that's all", "that is all")
 _NEGATE = ("不", "别", "还有", "等等", "等一下", "再")
+_NEGATE_EN = ("don't", "do not", "not yet", "wait", "another")
 
 
-def is_end_affirmation(text: str) -> bool:
-    """用户对「是否结束」的回答是否为肯定。规则版，TODO：可换成小模型分类。"""
+def is_end_affirmation(text: str, lang: str = "zh") -> bool:
+    """用户对「是否结束」的回答是否为肯定。规则版。"""
     if any(n in text for n in _NEGATE):
         return False
-    return any(a in text for a in _AFFIRM)
+    if any(a in text for a in _AFFIRM):
+        return True
+    if lang == "en":
+        low = text.lower()
+        if any(n in low for n in _NEGATE_EN):
+            return False
+        return any(a in low for a in _AFFIRM_EN)
+    return False
 
 
 _END_CMD = ("结束吧", "散会", "结束会议", "会议结束", "今天就到这", "先到这", "就到这里")
+_END_CMD_EN = ("end the meeting", "adjourn", "that's a wrap", "lets wrap up", "let's wrap up")
 
 
-def is_end_command(text: str) -> bool:
-    """用户主动宣布结束（不必等主持人问）。带否定词（「先别结束」「还不能散会」）不算。"""
+def is_end_command(text: str, lang: str = "zh") -> bool:
+    """用户主动宣布结束（不必等主持人问）。带否定词不算。"""
     if any(n in text for n in ("不", "别", "没", "等等", "等一下")):
         return False
-    return any(c in text for c in _END_CMD)
+    if any(c in text for c in _END_CMD):
+        return True
+    if lang == "en":
+        low = text.lower()
+        return any(c in low for c in _END_CMD_EN)
+    return False
 
 
 def monotonic_ms() -> Millis:

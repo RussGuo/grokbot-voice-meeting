@@ -117,6 +117,9 @@ const params = new URLSearchParams(location.search);
 const roomName = params.get("room") || "meeting-dev";
 const replayRun = params.get("replay");
 let identity = params.get("identity") || "";
+// Pre-signed join (GitHub Pages or any static host). No token server required.
+const presetUrl = params.get("liveKitUrl") || params.get("url") || "";
+const presetToken = params.get("token") || "";
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const fmt = (ms) => { const s = Math.max(0, Math.floor(ms / 1000)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; };
@@ -287,12 +290,15 @@ let TL = []; // 回放发言者时间线 [[at, holder|null]]
 function holderAt(t) { let h = null; for (const [a, x] of TL) { if (a > t) break; h = x; } return h; }
 function replayHist(id, n) {
   if (!RL) return new Array(n).fill(0);
-  const ids = Object.keys(RL.tracks), isH = id === S.humanId;
-  const tr = RL.tracks[isH ? S.humanId : ids.find((i) => i !== S.humanId)] || [];
+  const direct = RL.tracks[id];
+  const shared = !direct;
+  const ids = Object.keys(RL.tracks);
+  const tr = direct || RL.tracks[ids.find((i) => i !== S.humanId)] || [];
   const k = Math.floor(S.now / RL.step_ms), out = [];
+  const isH = id === S.humanId;
   for (let i = k - n + 1; i <= k; i++) {
     const db = tr[i] ?? -120, v = Math.max(0, Math.min(1, (db + 55) / 40));
-    out.push(isH || holderAt(i * RL.step_ms) === id ? v : 0);
+    out.push(!shared || isH || holderAt(i * RL.step_ms) === id ? v : 0);
   }
   return out;
 }
@@ -332,11 +338,16 @@ $("end").onclick = () => { if (confirm("确定结束会议？")) control("end");
 
 $("join").onclick = async () => {
   if (replayRun) return;
-  $("join").disabled = true; $("status").textContent = "获取 token…";
+  $("join").disabled = true; $("status").textContent = presetToken ? "正在连接…" : "获取 token…";
   try {
-    const r = await fetch(`/api/token?room=${encodeURIComponent(roomName)}${identity ? "&identity=" + encodeURIComponent(identity) : ""}`);
-    if (!r.ok) throw new Error(await r.text());
-    const { url, token, identity: myId } = await r.json();
+    let url, token, myId;
+    if (presetUrl && presetToken) {
+      url = presetUrl; token = presetToken; myId = identity || "host";
+    } else {
+      const r = await fetch(`/api/token?room=${encodeURIComponent(roomName)}${identity ? "&identity=" + encodeURIComponent(identity) : ""}`);
+      if (!r.ok) throw new Error(await r.text());
+      ({ url, token, identity: myId } = await r.json());
+    }
     identity = myId; S.humanId = myId; S.names[myId] ||= "用户"; ensureTile(myId);
     room = new Room({ adaptiveStream: true, audioCaptureDefaults: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
     room.on(RoomEvent.TrackSubscribed, (track, _pub, p) => {
@@ -377,6 +388,7 @@ $("join").onclick = async () => {
 };
 $("mute").onclick = async () => { const on = room.localParticipant.isMicrophoneEnabled; await room.localParticipant.setMicrophoneEnabled(!on); $("mute").textContent = on ? "取消静音" : "静音"; };
 $("leave").onclick = () => room?.disconnect();
+if (presetUrl && presetToken && !replayRun) $("status").textContent = "链接已带 token，点击加入";
 
 /* ---------------- 回放模式 ---------------- */
 if (replayRun) (async () => {

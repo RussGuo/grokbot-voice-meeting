@@ -1,8 +1,56 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
-name = "voice-meeting"
-version = "0.0.1"
-description = "多 Bot 语音会议插件原型（编排器 + LiveKit agent 入口）"
+name = "grokbot-voice-meeting"
+version = "0.1.0"
+description = "Multi-bot voice meetings for Grok Bot: a human and several agents in one LiveKit room."
+readme = "README.md"
 requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "grokbot-voice-meeting contributors" }]
+keywords = ["livekit", "voice", "meeting", "agents", "grok"]
+dependencies = [
+  "livekit-agents==1.8.9",
+  "livekit-plugins-openai==1.8.9",
+  "livekit-plugins-silero==1.8.9",
+  "livekit-api>=1.0",
+  "openai>=1.40",
+  "python-dotenv>=1.0",
+  "pyyaml>=6",
+  "numpy",
+  "aiohttp>=3.9",
+]
+
+[project.optional-dependencies]
+local = ["sherpa-onnx==2.0.1"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.6"]
+all = ["sherpa-onnx==2.0.1", "pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.6"]
+
+[project.scripts]
+meet = "meet.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/RussGuo/grokbot-voice-meeting"
+Documentation = "https://github.com/RussGuo/grokbot-voice-meeting#readme"
+
+[tool.setuptools.packages.find]
+include = ["orchestrator*", "meet*", "providers*", "voice*", "scripts*"]
+
+[tool.setuptools.package-data]
+voice = ["voice_layer/voices.json"]
 
 [tool.pytest.ini_options]
-testpaths = ["orchestrator/tests"]
+testpaths = ["orchestrator/tests", "meet/tests", "providers/tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+extend-exclude = ["runs", "voice/bench", ".venv"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+ignore = ["E501"]

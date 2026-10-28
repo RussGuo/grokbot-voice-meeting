@@ -1,7 +1,4 @@
-# 顶层（编排器 + agent 入口）。web/ 与 voice/ 各自维护自己的依赖。
-livekit-agents==1.8.9
-livekit-plugins-openai==1.8.9   # DeepSeek 走 OpenAI 兼容接口
-livekit-plugins-silero==1.8.9
-openai>=1.40
-python-dotenv>=1.0
-pytest>=8
+# Prefer the package:
+#   pip install -e ".[dev]"     # tests
+#   pip install -e ".[all]"     # tests + local sherpa ASR/TTS
+-e .[dev]

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .i18n import moderator_lines, normalize
 from .models import ID, Brief, ChatCtxRecipe, Meeting
 
 CONFIDENCE_THRESHOLD = 0.6
@@ -32,19 +33,12 @@ class FakeLLM:
     def _moderator(self, intent: str, meta: dict) -> dict[str, Any]:
         item = meta.get("agenda_title", "")
         human = self.meeting.voice.linked_human_id
+        lang = normalize(getattr(self.meeting, "language", "zh"))
         cos = self.meeting.moderator.mode == "chiefOfStaff"
-        texts = {
-            "open": (("我是 Chief of Staff，兼任本场主持，我有自己的立场，小结会尽量中立。" if cos else "欢迎。")
-                     + f"今天的议题是「{item}」。规则：用户随时可以打断，分身承诺当场生效、会后对账。"),
-            "confirm_end": "议程都过完了。用户，我们是否结束？",
-            "open_item": f"进入下一项：「{item}」。",
-            "recap": f"插一句，回到刚才「{meta.get('recap_item', '')}」那一项，有本体的答复要补充。",
-            "fill_silence": f"我小结一下「{item}」目前的讨论，还有谁要补充？",
-            "ask_human": "bot 们已经连续讨论了好几轮，用户，你怎么看？",
-            "cue": f"请{meta.get('target_name', '')}说说。",
-            "warn": "还剩 10 秒。",
-        }
-        return {"text": texts.get(intent, "好的。"), "provenance": "model", "confidence": 1.0,
+        texts = moderator_lines(lang, chief=cos)
+        text = texts.get(intent, "好的。" if lang == "zh" else "Okay.")
+        text = text.format(item=item, recap=meta.get("recap_item", ""), target=meta.get("target_name", ""))
+        return {"text": text, "provenance": "model", "confidence": 1.0,
                 "commitments": [], "addressees": [human] if intent == "ask_human" else []}
 
     def _member(self, pid: ID, meta: dict) -> dict[str, Any]:
