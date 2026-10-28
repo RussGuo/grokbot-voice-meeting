@@ -144,6 +144,11 @@ def member_lines(lang: str | None) -> dict[str, str]:
     }
 
 
+def notes_line(lang: str | None) -> str:
+    """FakeLLM 回退：引用自己笔记里检索到的原文（{text}）。"""
+    return "My notes say: {text}" if normalize(lang) == "en" else "我笔记里写着：{text}"
+
+
 def end_button(lang: str | None) -> str:
     return "(end button)" if normalize(lang) == "en" else "（结束按钮）"
 

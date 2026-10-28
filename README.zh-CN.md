@@ -76,6 +76,8 @@ flowchart LR
 
 显式设置 `MEETING_PRINCIPAL` 永远优先于默认值。
 
+用 `file` 或 `webhook` 时，需要问本体的替身先说「稍等，我问一下本体」，在 `MEETING_PRINCIPAL_INLINE_MS` 内等答复，到了就在同一轮原样念出来（「本体说：……」）。没等到就说一声先继续，答复之后照常作为待插回的答案进来，不会重复提问。纪要里会标出当场答复。
+
 会后 `meet followup runs/<id>`（或 `--room ROOM`，取该房间最新一次）根据 `minutes.md` 和 `actions/<bot>.json` 给每个 bot 写一段提示词。把这段交给**真实的** bot 去确认、更正或撤回。回写有两条路，都会追加 `ReconcileResult` 事件并重新生成纪要和行动项：
 
 - `meet followup runs/<id> --push URL`（默认取 `MEETING_FOLLOWUP_WEBHOOK`）把每段提示词 POST 出去，并采用 JSON 答复。
@@ -124,7 +126,7 @@ flowchart LR
 2. `MEETING_JOIN_PAGE` 设成那个 `index.html` 的 URL。
 3. 打开 `meet` 打印的链接。浏览器直连 LiveKit Cloud，不必把 token 服务暴露到公网。
 
-房间 metadata 对所有持 token 的人可见，所以只写 `{"v":1,"room":{"topic","who"}}`。完整场景（含 brief）只走派发 metadata，并存在 `links/<room>.scene.json`（权限 600）。`scripts/dispatch.py --room R` 默认发送这个文件（`--scene FILE` 指定，`--no-scene` 不带）。链接可以转发，brief 不会跟着走。
+房间 metadata 对所有持 token 的人可见，所以只写 `{"v":1,"room":{"topic","who"}}`。完整场景（含 brief）只走派发 metadata，并存在 `links/<room>.scene.json`（权限 600）。`scripts/dispatch.py --room R` 默认发送这个文件（`--scene FILE` 指定，`--no-scene` 不带）。链接可以转发，brief 不会跟着走。各 bot 的完整 context 同理：`links/<room>.context.json`（权限 600）只留在本机，场景里只有它的路径和哈希。
 
 `python web/token_server.py` 仍留给本机开发（默认只绑 `127.0.0.1`）。它的 `/` 会列出可回放的运行。放到隧道后面时设置 `MEETING_ACCESS_KEY`：用 `Authorization: Bearer <key>` 头，或用它下发的 cookie。旧的 `?k=<key>` 仍可用但不推荐，查询串会留在地址栏和代理日志里。服务端不会把口令写进日志。
 
@@ -149,6 +151,7 @@ flowchart LR
 | `MEETING_PRINCIPAL` | `meet` 开的会 `defer`，样例 `mock` | `defer` `mock` `file` `webhook` |
 | `MEETING_PRINCIPAL_DIR` / `MEETING_PRINCIPAL_WEBHOOK` | `runs/principal` / 空 | `file` 与 `webhook` 用 |
 | `MEETING_PRINCIPAL_DELAY_MS` | `20000` | `mock` 答复的延迟 |
+| `MEETING_PRINCIPAL_INLINE_MS` | `5000` | 替身在同一轮里等本体答复的时长（`file`/`webhook`；`0` 关闭）。`MEETING_PRINCIPAL_MOCK_INLINE=1` 让 `mock` 也这样答，用来演练 |
 | `MEETING_SCORER` | `rule` | `rule`；`llm` 为举手再加一层异步 LLM 重打分 |
 | `MEETING_FOLLOWUP_WEBHOOK` | 空 | `meet followup --push` 的默认地址 |
 | `MEETING_BOTS` | `./bots.yaml` | bot 注册表和上下文 |

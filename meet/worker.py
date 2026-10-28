@@ -44,6 +44,7 @@ from orchestrator.config import llm_config, report  # noqa: E402
 from orchestrator.orchestrator import Orchestrator, monotonic_ms  # noqa: E402
 from orchestrator.planner import DEFAULT_INLINE_MS, build_planner  # noqa: E402
 from orchestrator.principal import principal_from_env  # noqa: E402
+from orchestrator.retrieval import ContextIndex  # noqa: E402
 from orchestrator.scene import load_scene_metadata  # noqa: E402
 from orchestrator.summarize import build_summarizer  # noqa: E402
 
@@ -132,7 +133,9 @@ async def entrypoint(ctx: JobContext):
     run_id = make_run_id(room_name)          # <room>-<时间戳>；MEETING_RUN_ID 原样优先（run_sim.sh 用）
     run_dir = runs_root() / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
-    (meeting, briefs, voices), scenario = _runtime_meeting(ctx)
+    loaded_scene, scenario = _runtime_meeting(ctx)
+    (meeting, briefs, voices) = loaded_scene
+    bundle_ref = getattr(loaded_scene, "context_bundle", None)
     if scenario != "scene":
         # Dispatch metadata was empty. Room metadata is a second chance, but only after connect.
         pass
@@ -147,6 +150,7 @@ async def entrypoint(ctx: JobContext):
         loaded = load_scene_metadata(getattr(ctx.room, "metadata", None))
         if loaded:
             meeting, briefs, voices = loaded
+            bundle_ref = loaded.context_bundle
             _apply_env_overrides(meeting)
             meeting.voice.room = ctx.room.name
             scenario = "scene"
@@ -178,11 +182,14 @@ async def entrypoint(ctx: JobContext):
     log.info("LLM：%s（model=%s，thinking=disabled）；ASR=%s；TTS=%s", lc.provider, lc.model,
              cfg.resolve_asr_provider(), cfg.resolve_tts_provider())
     lang = getattr(meeting, "language", "zh")
+    # 各 bot 完整 context 的检索索引：场景里有 bundle 就加载（哈希不符 / 缺文件 → 空索引，照常开会）；会中加的 bot 也往里加
+    cindex = (ContextIndex.load(bundle_ref["path"], bundle_ref["sha256"]) if bundle_ref else None) or ContextIndex()
+    log.info("笔记检索：%d 个 bot，%d 段", len(cindex.bots()), cindex.chunk_count())
     # 有 key：LLM 规划器决定说什么（护栏在代码里）；没 key：退回 FakeLLM 规则台词
     ask_hook = _LateAskHook()
     voice = MeetingVoiceLayer(cfg, session, vad=adapters.make_vad(), room=ctx.room, human_id=human,
                               planner=build_planner(meeting, briefs, chat, lang, ask_hook=ask_hook,
-                                                    inline_ms=inline_budget_ms()),
+                                                    inline_ms=inline_budget_ms(), context_index=cindex),
                               chat=chat, moderator_id=mod, language=lang)
     await session.start(voice.agent_for(mod), room=ctx.room, room_options=room_options(cfg))
     speakers = None
@@ -210,6 +217,7 @@ async def entrypoint(ctx: JobContext):
                         clock=lambda: monotonic_ms() - t0,
                         summarizer=build_summarizer(chat, lang),   # 议程结论后台总结；chat 为 None 时只用兜底
                         scorer_chat=chat,                          # MEETING_SCORER=llm 时才启用二次打分
+                        context_index=cindex,                      # 笔记强命中也能举手
                         addable_bots=addable_bots(registry, (p.id for p in meeting.participants)))
     voice.token_valid = orch.token_valid
     if orch.principal.supports_inline and inline_budget_ms() > 0:     # defer 永远不答，不开快路径
@@ -242,7 +250,7 @@ async def entrypoint(ctx: JobContext):
             bot_id, meeting=meeting, registry=registry, voices=voices_in_use, chat=chat,
             model=lc.model if chat is not None else "heuristic", inbox=orch.inbox,
             apply_voice=lambda bid, spk: _apply(cfg, {bid: spk}), connect=connect,
-            warm=lambda bid: voice.agent_for(bid)))
+            warm=lambda bid: voice.agent_for(bid), context_index=cindex))
         bot_tasks.add(t)
         t.add_done_callback(bot_tasks.discard)
     orch.bot_spawner = _spawn_bot

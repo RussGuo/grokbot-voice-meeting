@@ -55,7 +55,7 @@ def build(events: Iterable[MeetingEvent]) -> dict:
             u = d["utterance"]
             tok = u.get("token_id") or ""
             utt.append((e.at, u["speaker_id"], u["agenda_item_id"], u["text"], u.get("provenance"),
-                        src.get(tok, "") + ("+inline" if tok in inline_toks else "")))
+                        src.get(tok, "") + ("+inline" if tok in inline_toks else ""), list(u.get("sources") or [])))
         elif e.type == "DecisionRecorded":
             decisions.append(dict(d["payload"]))
         elif e.type == "DecisionSummarized":     # 后台总结落地：覆盖同一议程项先前记录的兜底文本
@@ -111,8 +111,8 @@ def render_md(b: dict) -> str:
             for d in b["decisions"]] or [L["none"]]
     out += ["", L["transcript"]]
     src_tag = {"handRaise": L["tag_hand"], "pendingAnswer": L["tag_pending"], "human": ""}
-    for at, sp, ag, text, prov, source in b["utterances"]:
-        tag = L["prov"].format(prov=prov) if prov and prov != "model" else ""
+    for at, sp, ag, text, prov, source, sources in b["utterances"]:
+        tag = L["prov"].format(prov=f"{prov}: {', '.join(sources)}" if sources else prov) if prov and prov != "model" else ""
         src, _, inline = source.partition("+")
         tag = src_tag.get(src, "") + (inline_tag(m.get("language")) if inline else "") + tag
         out.append(L["utt"].format(t=at / 1000, ag=ag, name=n.get(sp, sp), tag=tag, text=text))

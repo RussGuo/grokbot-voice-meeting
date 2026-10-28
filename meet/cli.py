@@ -90,11 +90,13 @@ def cmd_start(args: argparse.Namespace) -> int:
         chat = make_chat(cfg)
         model = cfg.model
     briefs = {}
+    contexts = {}
     unknown_notes = []
     for bid in who:
         meta = dict(registry.get(bid) or {"display_name": bid})
         meta["id"] = bid
         text = context_from_dir(bid, args.context_dir, read_context(meta))
+        contexts[bid] = text
         brief = summarize(bot_id=bid, context=text, topic=topic, agenda=agenda, lang=lang, chat=chat, model=model)
         briefs[bid] = brief
         unknowns = list_unknowns(brief)
@@ -110,15 +112,26 @@ def cmd_start(args: argparse.Namespace) -> int:
     except ValueError as e:
         print(f"meet: voices: {e}", file=sys.stderr)
         return 2
-    scene = build_scene(
-        who=who, topic=topic, agenda=agenda_titles, briefs=briefs, voices=voices, registry=registry,
-        language=lang, moderator_id=mod_id, moderator_name=mod_meta.get("display_name"),
-    )
     room = _room_name(topic, args.room)
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", room):
         print("meet: room name must match [A-Za-z0-9_-]{1,64}", file=sys.stderr)
         return 2
-    from scripts.mklink import make_link
+    # The briefs are ~800 characters; the full contexts go to a private file the worker indexes for in-meeting search.
+    from meet.context_bundle import build_bundle, scene_ref
+    from scripts.mklink import make_link, write_context_file
+    bundle = build_bundle(contexts)
+    for w in bundle.warnings:
+        print(f"meet: warning: {w}", file=sys.stderr)
+    context_ref = None
+    context_file = None
+    if bundle:
+        data = bundle.to_json()
+        context_file = write_context_file(room, data)
+        context_ref = scene_ref(str(context_file), data)
+    scene = build_scene(
+        who=who, topic=topic, agenda=agenda_titles, briefs=briefs, voices=voices, registry=registry,
+        language=lang, moderator_id=mod_id, moderator_name=mod_meta.get("display_name"), context_bundle=context_ref,
+    )
     try:
         link_file = asyncio.run(make_link(room, scene, hours=args.hours, dispatch=not args.no_dispatch))
     except KeyError as e:
@@ -133,6 +146,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         "join_url": urls[0] if urls else "",
         "fallback_url": urls[1] if len(urls) > 1 else "",
         "link_file": str(link_file),
+        "context_file": str(context_file) if context_file else "",
         "language": lang,
         "who": who,
         "moderator": mod_id,
@@ -153,6 +167,8 @@ def cmd_start(args: argparse.Namespace) -> int:
                 print(f"  {line}")
         print("The worker must already be running: meet worker")
         print(f"link file: {link_file}")
+        if context_file:
+            print(f"context file: {context_file} (searched by the stand-ins during the meeting)")
     return 0
 
 
