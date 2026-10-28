@@ -48,6 +48,23 @@ def _human_name() -> str:
     return os.environ.get("MEETING_HUMAN_NAME") or "用户"
 
 
+def write_context_file(room: str, data: bytes, out_dir: Path | None = None) -> Path:
+    """Save the context bundle as <links>/<room>.context.json (chmod 600) and return its absolute path.
+
+    It holds every stand-in's full exported context, so it is as private as the link file. The scene carries
+    only its path and sha256 (see meet/context_bundle.py).
+    """
+    if not SAFE.fullmatch(room):
+        raise ValueError("room must match [A-Za-z0-9_-]{1,64}")
+    path = (Path(out_dir) if out_dir else ROOT / "links") / f"{room}.context.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    os.chmod(path, 0o600)
+    return path.resolve()
+
+
 async def make_link(room: str, scene: dict, out: Path | None = None, hours: float = 2.0,
                     dispatch: bool = True, empty_timeout_s: int = 30 * 60) -> Path:
     if not SAFE.fullmatch(room):

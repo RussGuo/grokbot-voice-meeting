@@ -15,6 +15,7 @@ Trigger phrases: "start a voice meeting with my X and Y bots about Z", "开一�
 1. Decide `who` (registry ids), `topic`, and optional agenda items. Ask only if more than one bot could match a name.
 2. For each participating bot, export **only context you actually have** into `contexts/<id>.md`.
    - Copy facts, decisions, and open questions from that bot's notes or from what the user just said.
+   - Export the full relevant notes, not only a summary. The stand-in searches this file during the meeting, so details left out cannot be found later. Only the brief is summarized.
    - If you do not know something, write `unknown: ...` (or `未知：...`). Do not invent numbers, dates, or owners.
    - If the bot may promise something, list it under a `Can commit:` / `可承诺:` heading, one item per line. Otherwise leave that heading off.
 3. Make sure `bots.yaml` (see `bots.example.yaml`) has a `display_name` and `aliases` for each id. Point `context_file` at the file you just wrote, or pass `--context-dir contexts`.
@@ -39,6 +40,7 @@ Questions a stand-in cannot answer go to the real bot through `PrincipalClient` 
 - `defer` is the default for meetings started with `meet`. The stand-in says it will check, the question is recorded unanswered, and it shows up in the minutes for the follow-up. Nothing is invented.
 - `mock` answers with a made-up placeholder after `MEETING_PRINCIPAL_DELAY_MS`. It is the default only for the sample scenarios and `meet demo`; do not set it for a real meeting.
 - An explicit `MEETING_PRINCIPAL` always wins over the default.
+- With `file` or `webhook`, a reply that arrives within `MEETING_PRINCIPAL_INLINE_MS` (default 5000 ms) is spoken in the same turn. If you are the principal, answer fast and short; a later reply is still used, just in a later turn.
 
 The worker waits `MEETING_JOIN_WAIT_S` (default 1800) for the human to open the link. If nobody joins, the run ends as `NoShow` and you must start a new meeting with `meet`.
 

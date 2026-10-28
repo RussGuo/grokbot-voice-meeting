@@ -13,6 +13,8 @@
   b. 头里的 commit 必须匹配 mandate.can_commit，否则中止流，改说安全话术并 ask_principal；
   c. relay（转述本体答案）不调 LLM，原样念；
   d. 被点名且 confidence < 0.6 → 问本体。
+  e. 笔记检索：有 context_index 时，成员发言前从「该 bot 自己」的完整笔记里取回相关原文放进提示词（上限 ~1200 字，每条带 id）；
+     头里的 sources 只保留真的取回过的 id，provenance=context 没有有效 sources 就降成 model。
 任何 LLM 错误 / 超时 / 头格式错 / 正文为空 → 回退 FakeLLM 的规划（文本与字段），原因记在 stats["fallback"]。
 主持人的程序性话术仍用模板；只有 fill_silence 可选用 LLM（失败回模板）。
 """
@@ -25,19 +27,25 @@ import re
 import time
 from typing import Any, AsyncIterator, Callable, Optional, Protocol, runtime_checkable
 
+from .chunker import FLUSH
 from .fake_llm import CONFIDENCE_THRESHOLD, FakeLLM
-from .i18n import normalize
+from .i18n import inline_principal_lines, normalize
 from .models import ID, Brief, ChatCtxRecipe, Meeting
+from .retrieval import Hit, format_excerpts, turn_query
 
 log = logging.getLogger("planner")
 
 ACTS = ("speak", "ask_principal", "commit")
-PROVENANCES = ("brief", "snapshot", "model")
+PROVENANCES = ("brief", "snapshot", "model", "context")
 HEADER_MAX_CHARS = 400
 HEADER_TIMEOUT_S = 2.5
 STALL_TIMEOUT_S = 8.0        # 正文开始后，相邻两块之间最长等待；超时就地收尾（不再回退，已经开口了）
 DEFAULT_MAX_TOKENS = 160     # 含头
-FIELD_KEYS = ("provenance", "confidence", "commitments", "addressees", "ask_principal")
+# principal_query_id / principal_pending：当场问过本体（见 InlineAsk），编排器据此不再重复提问
+FIELD_KEYS = ("provenance", "confidence", "commitments", "addressees", "ask_principal",
+              "principal_query_id", "principal_pending", "sources")
+DEFAULT_INLINE_MS = 5000     # MEETING_PRINCIPAL_INLINE_MS：同一轮里等本体答复的预算，0 = 关闭
+EXCERPT_K, EXCERPT_CHARS = 3, 1200     # 每轮最多取回几段、提示词里原文总长上限
 
 _SAFE_ASK = {
     "zh": "这个我需要和本体确认后再答复。",
@@ -219,14 +227,112 @@ class Planner(Protocol):
     async def plan(self, pid: ID, ctx: ChatCtxRecipe) -> PlanStream: ...
 
 
+# ———————————————————— 当场问本体 ————————————————————
+AskHook = Callable[[ID, str], "Optional[asyncio.Future[str]]"]
+
+
+class InlineAsk:
+    """要问本体的话轮，在同一轮里等答复：先垫一句，最多等 budget_s 秒，答到了就原样念出来。
+
+    hook(pid, question) 返回 Future[str]（Orchestrator.request_principal）。规划器只拿 Future，不碰编排器状态。
+    hook 为 None / 返回 None / Future 一开始就带异常（阶段不对、pending 已满）→ 不垫那句话，退回旧行为：
+    安全话术 + ask_principal 字段，由 bot.utterance 尾部走慢路径。
+    话轮结束时（超时、被打断、生成器被关）一律 cancel Future：此后到的答复编排器看到等待者已取消，走 pendingAnswer。
+    用 asyncio.wait 而不是 shield+wait_for：超时不会取消 Future，Future 被编排器 cancel（TTL）也不会冒充成「本任务被取消」，
+    本任务被取消时 CancelledError 原样传播（3.11 的 wait_for 可能吞掉取消）。
+    """
+
+    def __init__(self, hook: Optional[AskHook], budget_ms: int, lang: str):
+        self.hook = hook
+        self.budget_s = max(0, budget_ms) / 1000
+        self.lines = inline_principal_lines(lang)
+
+    @property
+    def enabled(self) -> bool:
+        """hook 可带 active 属性（worker 里晚绑定的 hook 在编排器就绪、本体支持当场答复前为 False）。"""
+        return self.hook is not None and self.budget_s > 0 and bool(getattr(self.hook, "active", True))
+
+    def _open(self, pid: ID, question: str) -> "Optional[asyncio.Future[str]]":
+        if not self.enabled or not question:
+            return None
+        try:
+            fut = self.hook(pid, question)             # type: ignore[misc]
+        except Exception:  # noqa: BLE001
+            log.exception("ask_hook 失败，退回旧的问本体路径")
+            return None
+        if fut is None:
+            return None
+        if fut.done():                                 # 立刻被拒：取走异常，免得 asyncio 报 never retrieved
+            if not fut.cancelled():
+                fut.exception()
+            return None
+        return fut
+
+    @staticmethod
+    def _outcome(fut: "asyncio.Future[str]") -> tuple[str, str]:
+        if not fut.done() or fut.cancelled():
+            return "timeout", ""
+        if fut.exception() is not None:
+            return "error", ""
+        text = (fut.result() or "").strip()
+        return ("answered", text) if text else ("timeout", "")
+
+    async def run(self, ps: "PlanStream", pid: ID, fields: dict, safe_text: str) -> AsyncIterator[str]:
+        """fields 带 ask_principal。ps.fields 在第一段文本产出前定稿（与 PlanStream 的约定一致）。"""
+        question = fields.get("ask_principal") or ""
+        fut = self._open(pid, question)
+        if fut is None:
+            ps.fields = fields
+            ps.stats["inline"] = "off" if not self.enabled else "unavailable"
+            yield safe_text
+            return
+        qid = getattr(fut, "query_id", None)
+        waiting = {k: v for k, v in fields.items() if k != "ask_principal"}
+        waiting.update(principal_query_id=qid, principal_pending=True)
+        ps.fields = waiting
+        ps.stats["inline"] = "cancelled"               # 先按「被打断」记；走完各分支会改写
+        t0 = time.perf_counter()
+        try:
+            yield self.lines["filler"]
+            yield FLUSH                                # 垫的那句现在就送 TTS，别等到下一块
+            await asyncio.wait({fut}, timeout=self.budget_s)
+            kind, text = self._outcome(fut)            # 超时后再看一眼：答复可能恰好同一刻到
+            ps.stats["inline_wait_ms"] = (time.perf_counter() - t0) * 1000
+        finally:
+            if not fut.done():
+                fut.cancel()
+        ps.stats["inline"] = kind
+        if kind == "answered":
+            ps.fields = {**{k: v for k, v in waiting.items() if k != "principal_pending"},
+                         "provenance": "principal", "confidence": 0.95}
+            yield self.lines["answer"].format(answer=text)
+        elif kind == "error":                          # 编排器在处理时又判了「不能问」：旧行为，问题由 utterance 尾部发出
+            ps.fields = fields
+            yield safe_text
+        else:
+            yield self.lines["timeout"]
+
+    def stream(self, pid: ID, plan: dict, stats: dict) -> "PlanStream":
+        """已定稿的 plan（带 ask_principal）包成当场问的流；plan["text"] 是退回旧行为时的安全话术。"""
+        fields = {k: plan[k] for k in FIELD_KEYS if k in plan}
+        fields.setdefault("commitments", [])
+        fields.setdefault("addressees", [])
+        ps = PlanStream(None, fields, {"path": "static", **stats}, plan["text"])
+        return ps.attach(self.run(ps, pid, fields, plan["text"]))
+
+
 class CallablePlanner:
     """包装老式同步规划函数（FakeLLM 等）。测试 / sim / 没有 LLM key 时用。"""
 
-    def __init__(self, fn: Callable[[ID, Any], dict]):
+    def __init__(self, fn: Callable[[ID, Any], dict], ask: Optional[InlineAsk] = None):
         self.fn = fn
+        self.ask = ask
 
     async def plan(self, pid: ID, ctx: ChatCtxRecipe) -> PlanStream:
-        return static_stream(self.fn(pid, ctx))
+        plan = self.fn(pid, ctx)
+        if self.ask is not None and self.ask.enabled and plan.get("ask_principal"):
+            return self.ask.stream(pid, plan, {})
+        return static_stream(plan)
 
 
 def as_planner(p: Any) -> Planner:
@@ -319,6 +425,17 @@ def _turn_prompt(lang: str, *, mandate_commit: list[str], mandate_ask: list[str]
     return "\n".join(lines)
 
 
+def _excerpt_prompt(lang: str, excerpts: str) -> str:
+    if lang == "en":
+        return ("Excerpts from your own notes (each starts with its id in brackets):\n" + excerpts + "\n"
+                "Besides your brief, you may use these excerpts when they answer the point. Do not state anything that is "
+                "not in your brief, these excerpts or what was said in the meeting. If you rely on an excerpt, set "
+                "provenance to \"context\" and add \"sources\":[ids] to the JSON line, e.g. \"sources\":[\"pm#3\"].")
+    return ("你自己笔记里的相关原文（每条以方括号里的 id 开头）：\n" + excerpts + "\n"
+            "除 brief 外，这些原文能回答时可以直接用。不要说 brief、这些原文和会上内容之外的事。"
+            "用了某条原文，就在 JSON 头里把 provenance 写成 \"context\"，并加上 \"sources\":[id]，例如 \"sources\":[\"pm#3\"]。")
+
+
 def _silence_prompt(lang: str, item: str) -> str:
     if lang == "en":
         return (f"As the neutral host, give a spoken recap of the discussion on \"{item}\" so far, using only the "
@@ -334,18 +451,21 @@ class LLMPlanner:
                  header_timeout: float = HEADER_TIMEOUT_S, header_max_chars: int = HEADER_MAX_CHARS,
                  max_tokens: int = DEFAULT_MAX_TOKENS, temperature: float = 0.4,
                  stall_timeout: float = STALL_TIMEOUT_S, moderator_llm: bool = True,
-                 fake: Optional[Callable[[ID, Any], dict]] = None):
+                 fake: Optional[Callable[[ID, Any], dict]] = None, context_index: Any = None,
+                 ask_hook: Optional[AskHook] = None, inline_ms: int = DEFAULT_INLINE_MS):
         self.meeting = meeting
         self.briefs = briefs
         self.chat = chat
         self.lang = normalize(language or getattr(meeting, "language", "zh"))
-        self.fake = fake or FakeLLM(meeting, briefs)
+        self.context_index = context_index       # retrieval.ContextIndex | None：每个 bot 自己的完整笔记
+        self.fake = fake or FakeLLM(meeting, briefs, context_index)
         self.header_timeout = header_timeout
         self.header_max_chars = header_max_chars
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.stall_timeout = stall_timeout
         self.moderator_llm = moderator_llm
+        self.ask = InlineAsk(ask_hook, inline_ms, self.lang)     # 没有 hook / 预算为 0 = 关闭，行为与改动前一致
         self.stats: list[dict] = []          # 每轮 PlanStream.stats 的引用，便于外部汇总
 
     # —— 入口 ——
@@ -369,7 +489,10 @@ class LLMPlanner:
                     else f"I need to ask my principal about \"{term}\" and will follow up.")
             fields = {"provenance": "model", "confidence": 0.3, "commitments": [], "addressees": [],
                       "ask_principal": last}
-            return self._track(static_stream({"text": line, **fields}, {"path": "must_ask", "guard": "must_ask"}))
+            plan = {"text": line, **fields}
+            if self.ask.enabled:
+                return self._track(self.ask.stream(pid, plan, {"path": "must_ask", "guard": "must_ask"}))
+            return self._track(static_stream(plan, {"path": "must_ask", "guard": "must_ask"}))
         return self._track(self._member_stream(pid, ctx, base, brief, last))
 
     def _track(self, ps: PlanStream) -> PlanStream:
@@ -379,10 +502,38 @@ class LLMPlanner:
         return ps
 
     # —— 提示词 ——
-    def _member_messages(self, pid: ID, ctx: ChatCtxRecipe, brief: Brief, last: str) -> list[dict]:
+    def _retrieve(self, pid: ID, ctx: ChatCtxRecipe) -> list[Hit]:
+        """从 pid 自己的笔记里取回与这一轮相关的原文；没有索引 / 没命中 / 出任何错都是 []，不影响发言。"""
+        if not self.context_index:
+            return []
+        try:
+            main, extra = turn_query(ctx.turn_meta)
+            return self.context_index.search(pid, main, k=EXCERPT_K, extra=extra)
+        except Exception:  # noqa: BLE001
+            log.exception("笔记检索失败，本轮不带原文")
+            return []
+
+    @staticmethod
+    def _with_sources(fields: dict, header: dict, hits: list[Hit]) -> dict:
+        """头里的 sources 只认真的取回过的 id；provenance=context 没有有效来源就降成 model，有有效来源的 model 升成 context。"""
+        raw = header.get("sources")
+        known = {h.id for h in hits}
+        srcs = list(dict.fromkeys(s for s in raw if isinstance(s, str) and s in known)) if isinstance(raw, list) else []
+        if srcs:
+            fields["sources"] = srcs
+            if fields.get("provenance") == "model":
+                fields["provenance"] = "context"
+        elif fields.get("provenance") == "context":
+            fields["provenance"] = "model"
+        return fields
+
+    def _member_messages(self, pid: ID, ctx: ChatCtxRecipe, brief: Brief, last: str,
+                         hits: tuple[Hit, ...] | list[Hit] = ()) -> list[dict]:
         meta = ctx.turn_meta
         people = "; ".join(f"{p.id}={p.display_name}" for p in self.meeting.participants if p.id != pid)
         msgs = ctx.to_messages()
+        if hits:
+            msgs.append({"role": "user", "content": _excerpt_prompt(self.lang, format_excerpts(list(hits), EXCERPT_CHARS))})
         msgs.append({"role": "user", "content": _turn_prompt(
             self.lang, mandate_commit=list(brief.mandate.can_commit), mandate_ask=list(brief.mandate.must_ask),
             people=people, item=meta.get("agenda_title", ""),
@@ -460,13 +611,16 @@ class LLMPlanner:
                           last: str) -> AsyncIterator[str]:
         t0 = time.perf_counter()
         it = None
+        hits = self._retrieve(pid, ctx)
+        if hits:
+            ps.stats["retrieved"] = [h.id for h in hits]
         try:
             # 阶段 1：读到完整的头（带截止时间与长度上限）
             reason: Optional[str] = None
             header: Optional[dict] = None
             rest = ""
             try:
-                it = self._open(self._member_messages(pid, ctx, brief, last))
+                it = self._open(self._member_messages(pid, ctx, brief, last, hits))
                 parser = HeaderParser(self.header_max_chars)
                 deadline = t0 + self.header_timeout
                 while header is None:
@@ -491,7 +645,8 @@ class LLMPlanner:
                 reason = f"error:{type(e).__name__}"
             if header is None:
                 await self._close(it)
-                yield self._fallback(ps, base, reason or "no_header")
+                async for p in self._fallback_gen(ps, pid, base, reason or "no_header"):
+                    yield p
                 return
             ps.stats["header_ms"] = (time.perf_counter() - t0) * 1000
 
@@ -499,7 +654,8 @@ class LLMPlanner:
             verdict = self._validate(header, pid, ctx, brief, last)
             if verdict[0] == "bad":
                 await self._close(it)
-                yield self._fallback(ps, base, verdict[1])
+                async for p in self._fallback_gen(ps, pid, base, verdict[1]):
+                    yield p
                 return
             ps.stats["act"] = header.get("act")
             if verdict[0] == "ask":
@@ -507,9 +663,15 @@ class LLMPlanner:
                 await self._close(it)          # 中止流：模型生成的正文一个字也不说
                 ps.fields = fields
                 ps.stats["guard"] = guard
-                yield line
+                async for p in self._ask_or_say(ps, pid, fields, line):
+                    yield p
                 return
-            ps.fields = verdict[1]
+            ps.fields = self._with_sources(verdict[1], header, hits)
+            if ps.fields.get("ask_principal") and self.ask.enabled:    # act=ask_principal：不念模型的正文，当场问
+                await self._close(it)
+                async for p in self.ask.run(ps, pid, ps.fields, safe_ask_line(self.lang)):
+                    yield p
+                return
 
             # 阶段 3：正文边到边送出
             spoken = False
@@ -532,12 +694,27 @@ class LLMPlanner:
                     break
                 pending = piece if spoken else piece.lstrip()
             if not spoken:
-                yield self._fallback(ps, base, err or "empty_speech")
+                async for p in self._fallback_gen(ps, pid, base, err or "empty_speech"):
+                    yield p
             elif err:
                 ps.stats["truncated"] = err
         finally:
             if it is not None:
                 await self._close(it)
+
+    async def _ask_or_say(self, ps: PlanStream, pid: ID, fields: dict, text: str) -> AsyncIterator[str]:
+        """fields 带 ask_principal 时：能当场问就当场问，否则说安全话术（fields 交给 utterance 尾部走慢路径）。"""
+        if fields.get("ask_principal") and self.ask.enabled:
+            async for p in self.ask.run(ps, pid, fields, text):
+                yield p
+        else:
+            ps.fields = fields
+            yield text
+
+    async def _fallback_gen(self, ps: PlanStream, pid: ID, base: dict, reason: str) -> AsyncIterator[str]:
+        text = self._fallback(ps, base, reason)
+        async for p in self._ask_or_say(ps, pid, ps.fields, text):
+            yield p
 
     # —— 主持人 fill_silence ——
     def _moderator_stream(self, ctx: ChatCtxRecipe, base: dict) -> PlanStream:
@@ -581,8 +758,13 @@ class LLMPlanner:
 
 
 def build_planner(meeting: Meeting, briefs: dict[ID, Brief], chat: Any = None,
-                  language: Optional[str] = None, **kw: Any) -> Planner:
-    """chat 不为 None → LLM 规划器（回退用 FakeLLM）；否则就是 FakeLLM 的包装（测试 / sim / 无 key）。"""
+                  language: Optional[str] = None, *, context_index: Any = None, ask_hook: Optional[AskHook] = None,
+                  inline_ms: int = DEFAULT_INLINE_MS, **kw: Any) -> Planner:
+    """chat 不为 None → LLM 规划器（回退用 FakeLLM）；否则就是 FakeLLM 的包装（测试 / sim / 无 key）。
+    context_index：retrieval.ContextIndex，成员发言时检索自己的完整笔记（两条路径都用）。
+    ask_hook（Orchestrator.request_principal）打开「同一轮里问本体」；不给或 inline_ms=0 则保持旧行为。"""
     if chat is None:
-        return CallablePlanner(FakeLLM(meeting, briefs))
-    return LLMPlanner(meeting, briefs, chat, language, **kw)
+        ask = InlineAsk(ask_hook, inline_ms, language or getattr(meeting, "language", "zh"))
+        return CallablePlanner(FakeLLM(meeting, briefs, context_index), ask if ask.enabled else None)
+    return LLMPlanner(meeting, briefs, chat, language, context_index=context_index, ask_hook=ask_hook,
+                      inline_ms=inline_ms, **kw)

@@ -136,12 +136,19 @@ def pick_voice(bot_id: str, voices: dict[str, str], preferred: str | None = None
     return out[bot_id]
 
 
-def _brief_sync(bot_id: str, meta: dict, topic: str, agenda: list[dict], lang: str, chat: Any, model: str) -> dict:
-    """阻塞：读 context + 摘要 brief（可能是 LLM 调用）。只在线程里跑。LLM 失败退回启发式 brief。"""
+def _brief_sync(bot_id: str, meta: dict, topic: str, agenda: list[dict], lang: str, chat: Any, model: str,
+                context_index: Any = None) -> dict:
+    """阻塞：读 context + 摘要 brief（可能是 LLM 调用）。只在线程里跑。LLM 失败退回启发式 brief。
+    有 context_index 时顺手把完整 context 分段建索引（ContextIndex.add_bot 是整体换入，线程里调用安全）。"""
     try:
         context = read_context({**meta, "id": bot_id})
     except (OSError, ValueError) as e:
         raise ControlError("context_unreadable") from e
+    if context_index is not None and context:
+        try:
+            context_index.add_bot(bot_id, context)
+        except Exception as e:  # noqa: BLE001 — 没有笔记检索不该让 bot 加不进来
+            log.warning("bot %s 的笔记建索引失败（%s），本场它没有笔记检索", bot_id, type(e).__name__)
     try:
         return summarize(bot_id=bot_id, context=context, topic=topic, agenda=agenda, lang=lang, chat=chat, model=model)
     except Exception as e:  # noqa: BLE001 — LLM / 网络 / 缓存任何失败都不该让 bot 加不进来
@@ -153,7 +160,7 @@ def _brief_sync(bot_id: str, meta: dict, topic: str, agenda: list[dict], lang: s
 
 
 async def build_bot(bot_id: str, *, meeting, registry: dict[str, dict], voices: dict[str, str], chat: Any = None,
-                    model: str = "heuristic") -> BuiltBot:
+                    model: str = "heuristic", context_index: Any = None) -> BuiltBot:
     """校验 → 分配音色 → 线程里摘要 brief → 组装 Participant + Brief。
 
     事件循环上只做廉价的快照与校验；阻塞调用 summarize 在 asyncio.to_thread 里。音色在事件循环上分配并立刻记进 voices
@@ -172,7 +179,8 @@ async def build_bot(bot_id: str, *, meeting, registry: dict[str, dict], voices: 
     voices[bot_id] = voice
     try:
         blob = await asyncio.wait_for(
-            asyncio.to_thread(_brief_sync, bot_id, dict(meta), topic, agenda, lang, chat, model), BUILD_TIMEOUT_S)
+            asyncio.to_thread(_brief_sync, bot_id, dict(meta), topic, agenda, lang, chat, model, context_index),
+            BUILD_TIMEOUT_S)
     except BaseException:
         voices.pop(bot_id, None)
         raise
@@ -184,14 +192,15 @@ async def build_bot(bot_id: str, *, meeting, registry: dict[str, dict], voices: 
 async def run_bot_add(bot_id: str, *, meeting, registry: dict[str, dict], voices: dict[str, str], chat: Any,
                       model: str, inbox: Any, apply_voice: Callable[[str, str], None],
                       connect: Optional[Callable[[str, str], Awaitable[None]]] = None,
-                      warm: Optional[Callable[[str], Any]] = None) -> None:
+                      warm: Optional[Callable[[str], Any]] = None, context_index: Any = None) -> None:
     """后台任务：build_bot → 写音色 → 连接独立参会者 → 预热 TTS → 把结果投回编排器 inbox。
     成功投 control.bot_ready（带 Participant + Brief 对象），任何失败投 control.bot_failed；绝不向外抛（会议不能因此崩）。"""
     def fail(code: str) -> None:
         inbox.put_nowait({"type": "control.bot_failed", "bot_id": bot_id, "reason": code})
 
     try:
-        built = await build_bot(bot_id, meeting=meeting, registry=registry, voices=voices, chat=chat, model=model)
+        built = await build_bot(bot_id, meeting=meeting, registry=registry, voices=voices, chat=chat, model=model,
+                                context_index=context_index)
     except asyncio.CancelledError:
         raise
     except ControlError as e:

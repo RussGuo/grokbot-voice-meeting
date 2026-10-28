@@ -59,7 +59,7 @@ flowchart LR
 
 One LiveKit agent session holds the floor. Each bot also joins as its own participant (`BotSpeakers`), so the active tile lights up. The worker's own track stays silent on purpose; the acceptance check measures the bot tracks.
 
-The LLM planner (`orchestrator/planner.py`) decides what a bot says and whether it speaks, asks its principal, or commits. One streaming call per turn: a one-line JSON header, then the spoken text. The guards are code, not prompt: a topic in `must_ask` goes to the principal before any LLM call, a commitment must match `can_commit` or it is stopped before the first word, relayed answers are read verbatim, and low confidence when addressed means ask. Any LLM error falls back to the rule-based FakeLLM lines; without an LLM key the planner is off. Hand scoring is rule-based and English-aware by default; `MEETING_SCORER=llm` adds an async LLM re-scorer. Agenda decisions get a fallback line at once and an LLM summary in the background (`DecisionSummarized`).
+The LLM planner (`orchestrator/planner.py`) decides what a bot says and whether it speaks, asks its principal, or commits. One streaming call per turn: a one-line JSON header, then the spoken text. The guards are code, not prompt: a topic in `must_ask` goes to the principal before any LLM call, a commitment must match `can_commit` or it is stopped before the first word, relayed answers are read verbatim, and low confidence when addressed means ask. Any LLM error falls back to the rule-based FakeLLM lines; without an LLM key the planner is off. Each stand-in also searches its own full exported context during the meeting: `meet` writes it, chunked, to `links/<room>.context.json` (mode 600; the scene carries only its path and sha256), and the worker builds an offline BM25 index per bot. The planner adds the best excerpts of that bot's own notes to the prompt, and the minutes show which excerpt ids a line came from. Hand scoring is rule-based and English-aware by default; `MEETING_SCORER=llm` adds an async LLM re-scorer. Agenda decisions get a fallback line at once and an LLM summary in the background (`DecisionSummarized`).
 
 ## Grok Bot
 
@@ -75,6 +75,8 @@ In-meeting questions the stand-in cannot answer use `PrincipalClient` (`orchestr
 | `webhook` | POST the question. `{"text": "..."}` is delivered; otherwise the file inbox is used. |
 
 An explicit `MEETING_PRINCIPAL` always wins over the default.
+
+With `file` or `webhook`, a stand-in that has to ask says "One moment, let me check with my principal", waits up to `MEETING_PRINCIPAL_INLINE_MS`, and reads the reply verbatim ("My principal says: ...") in the same turn. If it is not back in time the stand-in says so and moves on; the reply then arrives the usual way, as a later pending answer. The minutes mark in-turn replies.
 
 Afterward, `meet followup runs/<id>` (or `--room ROOM` for the newest run of a room) writes a prompt per bot from `minutes.md` and `actions/<bot>.json`. Send that prompt to the real bot. Close the loop two ways, both recorded as a `ReconcileResult` event with minutes and actions re-rendered:
 
@@ -124,7 +126,7 @@ How to add an adapter: [docs/PROVIDERS.md](docs/PROVIDERS.md).
 2. Set `MEETING_JOIN_PAGE` to that `index.html` URL.
 3. Open the link `meet` prints. The browser talks to LiveKit Cloud directly. You do not expose the token server.
 
-Room metadata is readable by everyone holding a token, so it carries only `{"v":1,"room":{"topic","who"}}`. The full scene, briefs included, goes only in dispatch metadata and in `links/<room>.scene.json` (mode 600). `scripts/dispatch.py --room R` sends that file by default (`--scene FILE` to pick one, `--no-scene` to send none). The link can be forwarded; the briefs do not travel with it.
+Room metadata is readable by everyone holding a token, so it carries only `{"v":1,"room":{"topic","who"}}`. The full scene, briefs included, goes only in dispatch metadata and in `links/<room>.scene.json` (mode 600). `scripts/dispatch.py --room R` sends that file by default (`--scene FILE` to pick one, `--no-scene` to send none). The link can be forwarded; the briefs do not travel with it. The same goes for the full contexts: `links/<room>.context.json` (mode 600) stays on the machine, and the scene holds only its path and hash.
 
 `python web/token_server.py` remains for local development (binds `127.0.0.1` unless `WEB_HOST` says otherwise). Its `/` lists runs you can replay. Behind a tunnel, set `MEETING_ACCESS_KEY`: send it as `Authorization: Bearer <key>` or use the cookie it sets. The old `?k=<key>` still works but is discouraged, since the query string lands in address bars and proxy logs. The server never logs the key.
 
@@ -149,6 +151,7 @@ Room metadata is readable by everyone holding a token, so it carries only `{"v":
 | `MEETING_PRINCIPAL` | `defer` for `meet` meetings, `mock` for samples | `defer` `mock` `file` `webhook` |
 | `MEETING_PRINCIPAL_DIR` / `MEETING_PRINCIPAL_WEBHOOK` | `runs/principal` / empty | For `file` and `webhook` |
 | `MEETING_PRINCIPAL_DELAY_MS` | `20000` | Delay of the `mock` reply |
+| `MEETING_PRINCIPAL_INLINE_MS` | `5000` | How long a stand-in waits for its principal inside the same turn (`file`/`webhook`; `0` = off). `MEETING_PRINCIPAL_MOCK_INLINE=1` lets `mock` do it too |
 | `MEETING_SCORER` | `rule` | `rule`, or `llm` to add an async LLM re-scorer for raised hands |
 | `MEETING_FOLLOWUP_WEBHOOK` | empty | Default `--push` URL for `meet followup` |
 | `MEETING_BOTS` | `./bots.yaml` | Registry of bots and context |

@@ -5,7 +5,8 @@
   一次覆盖所有成员 bot，返回 {bot_id: {relevance, novelty, gist}}。结果当作 `scorer.update`
   事件投回编排器 inbox（与 principal.answered 同一条路），由编排器丢弃过期结果、重算 S、
   补举手 / 替换 / 撤回。任何 LLM 错误都静默回落到规则分（只打一次 warning）。
-- `build_scorer(briefs, aliases, chat=None, mode=None)`：mode 取自环境变量 MEETING_SCORER=rule|llm。
+- `build_scorer(briefs, aliases, chat=None, mode=None, context_index=None)`：context_index 是 bot 自己完整笔记的检索索引，
+  规则分里笔记强命中可以举手（见 RuleScorer）；mode 取自环境变量 MEETING_SCORER=rule|llm。
   mode=llm 但没有 chat（没配 key）时退回规则版。
 """
 from __future__ import annotations
@@ -117,8 +118,8 @@ class LlmBatchScorer(RuleScorer):
     async_updates = True
 
     def __init__(self, briefs: dict[ID, Brief], aliases: dict[ID, list[str]], chat: Any, *,
-                 timeout_s: float = LLM_TIMEOUT_S, max_tokens: int = 400):
-        super().__init__(briefs, aliases)
+                 timeout_s: float = LLM_TIMEOUT_S, max_tokens: int = 400, context_index: Any = None):
+        super().__init__(briefs, aliases, context_index)
         self.chat = chat
         self.timeout_s = timeout_s
         self.max_tokens = max_tokens
@@ -220,14 +221,14 @@ class LlmBatchScorer(RuleScorer):
 
 
 def build_scorer(briefs: dict[ID, Brief], aliases: dict[ID, list[str]], chat: Any = None,
-                 mode: Optional[str] = None) -> Scorer:
+                 mode: Optional[str] = None, context_index: Any = None) -> Scorer:
     """mode 缺省读环境变量 MEETING_SCORER（rule | llm，默认 rule）。llm 没有 chat 时退回 rule。"""
     mode = (mode or os.environ.get("MEETING_SCORER") or "rule").strip().lower()
     if mode == "llm":
         if chat is None:
             log.warning("MEETING_SCORER=llm 但没有可用的 LLM（未配置 key），退回规则打分")
         else:
-            return LlmBatchScorer(briefs, aliases, chat)
+            return LlmBatchScorer(briefs, aliases, chat, context_index=context_index)
     elif mode != "rule":
         log.warning("未知的 MEETING_SCORER=%r，按 rule 处理", mode)
-    return RuleScorer(briefs, aliases)
+    return RuleScorer(briefs, aliases, context_index)
