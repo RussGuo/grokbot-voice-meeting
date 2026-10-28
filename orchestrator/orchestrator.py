@@ -61,6 +61,10 @@ def clean_title(raw: Any) -> Optional[str]:
     return text if 0 < len(text) <= MAX_TITLE_CHARS else None
 
 
+class PrincipalUnavailable(Exception):
+    """request_principal 的 Future 上的异常：当场问不了（原因见 args[0]），规划器退回「安全话术 + ask_principal」。"""
+
+
 class Orchestrator:
     def __init__(self, meeting: Meeting, briefs: dict[ID, Brief], voice: VoiceLayer,
                  principal_factory: Callable[["Orchestrator"], PrincipalClient],
@@ -114,6 +118,11 @@ class Orchestrator:
         self.minutes: list[str] = []
         self.utterances: list[Utterance] = []
         self.queries: dict[ID, PrincipalQuery] = {}
+        # 当场问本体（request_principal）：query_id → (规划器等着的 Future, 令牌 id)；令牌 id → 已当场送达的 query_id
+        self._inline_waiters: dict[ID, tuple[asyncio.Future, ID]] = {}
+        self._inline_delivered: dict[ID, list[ID]] = {}
+        self._ask_tasks: set[asyncio.Task] = set()      # 后台 principal.ask（webhook 最长阻塞 10s，不能卡住事件循环）
+        self.inbox: Optional[asyncio.Queue] = None      # run() 里才有；之前 deliver_to 退回定时器
         self.commitments: dict[ID, Commitment] = {}
         self.started_at: Millis = 0
         self.metrics: dict[str, list[float]] = {"switch_ms": [], "bargein_stop_ms": []}
@@ -307,6 +316,7 @@ class Orchestrator:
             if q.status in ("pending", "answered"):
                 if q.status == "pending":
                     self.sm.pending_count = max(0, self.sm.pending_count - 1)
+                    self._cancel_waiter(q.id)
                 q.status = "deferredToMinutes"
                 self.emit("PrincipalDeferred", query=q, reason="meeting_end")
         await self._drain_summaries()          # 纪要从事件流生成：总结要赶在 MeetingEnded 之前落地
@@ -734,7 +744,9 @@ class Orchestrator:
         self._append_utterance(u)
         for c in u.commitments:
             self.emit("CommitmentMade", commitment=c)   # 决策 1：当场生效 binding
-        if ev.get("ask_principal") and self.sm.floor in (F.PLAYING, F.DUCKING):
+        self._inline_delivered.pop(tok.id, None)          # 本轮说完了：当场送达的答复算数
+        # principal_query_id：规划器已经当场问过了（查询在话轮内建好），别再问一次
+        if ev.get("ask_principal") and not ev.get("principal_query_id") and self.sm.floor in (F.PLAYING, F.DUCKING):
             await self._ask_principal(pid, ev["ask_principal"])
 
     def _guard_commitments(self, pid: ID, texts: list[str]) -> list[str]:
@@ -744,27 +756,100 @@ class Orchestrator:
             return []
         return [t for t in texts if not any(m and m in t for m in b.mandate.must_ask)]
 
-    async def _ask_principal(self, pid: ID, question: str) -> None:
-        mine = [q for q in self.queries.values() if q.asked_by == pid and q.status == "pending"]
-        if len(mine) >= self.rules.max_pending_per_bot:
-            return
+    def _new_query(self, pid: ID, question: str, query_id: Optional[ID] = None) -> PrincipalQuery:
         p = self.m.participant(pid)
         remaining = max(1, self.rules.total_ms - (self.now() - self.started_at))
-        q = PrincipalQuery(id=f"pq-{next(self._q_ids)}", asked_by=pid,
+        q = PrincipalQuery(id=query_id or f"pq-{next(self._q_ids)}", asked_by=pid,
                            principal_bot_id=p.principal_ref.bot_id if p.principal_ref else pid,
                            question=question, agenda_item_id=self.agenda_id,
                            context_event_seq=self.log.last_seq, asked_at=self.now(), ttl_ms=remaining)
         self.queries[q.id] = q
+        return q
+
+    def _pending_of(self, pid: ID) -> int:
+        return sum(1 for q in self.queries.values() if q.asked_by == pid and q.status == "pending")
+
+    async def _ask_principal(self, pid: ID, question: str) -> None:
+        if self._pending_of(pid) >= self.rules.max_pending_per_bot:
+            return
+        q = self._new_query(pid, question)
         self.sm.to_floor(F.ASKING_PRINCIPAL)
         self.sm.pending_asked()
         self.emit("PrincipalAsked", query=q)
         self.schedule_timer(q.ttl_ms, {"type": "timer.principalTtl", "query_id": q.id})
         await self.principal.ask(q)
 
+    # —— 当场问本体（快路径）——
+    def request_principal(self, pid: ID, question: str) -> "asyncio.Future[str]":
+        """规划器（跑在语音层的 producer task 里，与本循环并发）用它在话轮内问本体。
+
+        这里只建 Future 并投一个 principal.ask_now 事件，查询、pending 计数、TTL、PrincipalAsked 都由
+        _on_principal_ask_now 在本循环里做——规划器不碰编排器状态。例外是只读的预检和预分配 query id：
+        id 要在话轮内就写进 bot.utterance（principal_query_id），utterance 尾部才知道「已经问过了」。
+        不能问（阶段不对 / 没有这位 bot 的话轮 / pending 已满）→ 返回已带异常的 Future，规划器据此立刻退回旧行为。
+        Future 的结果是本体的答复文本；规划器在超时 / 被打断时自己 cancel 它，迟到的答复就走 pendingAnswer 慢路径。
+        """
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        why = self._inline_block(pid)
+        if why:
+            fut.set_exception(PrincipalUnavailable(why))
+            return fut
+        qid = f"pq-{next(self._q_ids)}"
+        fut.query_id = qid                      # type: ignore[attr-defined]
+        deliver_to(self)(0, {"type": "principal.ask_now", "participant_id": pid, "question": question,
+                             "query_id": qid, "future": fut})
+        return fut
+
+    def _inline_block(self, pid: ID) -> Optional[str]:
+        """当场问不了的原因（只读判断）。floor 状态机不动：bot 正在 PLAYING / DUCKING，话还没说完；
+        ASKING_PRINCIPAL 只能回 FloorIdle，会把还在说话的 bot 的话轮截断。pending 计数是并行区，照常加。"""
+        if self.sm.phase not in (Phase.IN_AGENDA, Phase.DECIDING):
+            return "phase"
+        tok = self.token
+        if tok is None or tok.holder_id != pid or not self.sm.bot_speaking:
+            return "no_floor"
+        if self._pending_of(pid) >= self.rules.max_pending_per_bot:
+            return "pending_limit"
+        return None
+
+    async def _on_principal_ask_now(self, ev):
+        fut: asyncio.Future = ev["future"]
+        pid, question = ev["participant_id"], ev["question"]
+        why = self._inline_block(pid)       # 投递到处理之间状态可能变了，再判一次
+        if why:
+            if not fut.done():
+                fut.set_exception(PrincipalUnavailable(why))
+            return
+        q = self._new_query(pid, question, ev.get("query_id"))
+        self.sm.pending_asked()
+        self.emit("PrincipalAsked", query=q, inline=True)
+        self.schedule_timer(q.ttl_ms, {"type": "timer.principalTtl", "query_id": q.id})
+        if not fut.done():                  # 规划器已放弃（话轮被打断）：问题照样发出去，答复走慢路径
+            self._inline_waiters[q.id] = (fut, self.token.id)
+        t = asyncio.create_task(self._ask_bg(q))
+        self._ask_tasks.add(t)
+        t.add_done_callback(self._ask_tasks.discard)
+
+    async def _ask_bg(self, q: PrincipalQuery) -> None:
+        try:
+            await self.principal.ask(q)
+        except Exception:  # noqa: BLE001  发不出去：查询保持 pending，等 TTL 标成未答；规划器预算到了自己收场
+            log.exception("principal.ask 失败：%s", q.id)
+
+    def _inline_requeue(self, token_id: ID) -> None:
+        """话轮没走完（被打断 / 收回）：已经「当场送达」但可能没播出去的答复，退回 pendingAnswer 慢路径，宁可重复不丢。"""
+        for qid in self._inline_delivered.pop(token_id, []):
+            q = self.queries.get(qid)
+            if q is not None and q.status == "deliveredInMeeting":
+                q.status = "answered"
+                self.emit("PrincipalAnswered", query=q, inline=False, requeued=True, token_id=token_id)
+                self.sched.answer_ready(q)
+
     async def _on_tts_done(self, ev):
         if self._stale(ev):
             return
         tok = self.token
+        self._inline_delivered.pop(tok.id, None)
         if self.sm.floor == F.DUCKING:
             self.voice.restore()
         self.emit("FloorReleased", token=tok)
@@ -799,6 +884,15 @@ class Orchestrator:
         q.answer = PrincipalAnswer(text=ev["text"], received_at=self.now())
         q.round_trip_ms = self.now() - q.asked_at
         self.sm.pending_resolved()
+        waiter = self._inline_waiters.pop(q.id, None)
+        if waiter is not None and not waiter[0].done() and ev["text"].strip():
+            # 规划器还在话轮里等：答复当场交给它念，不入 pendingAnswer 队列
+            fut, token_id = waiter
+            q.status = "deliveredInMeeting"
+            self.emit("PrincipalAnswered", query=q, inline=True, token_id=token_id)
+            self._inline_delivered.setdefault(token_id, []).append(q.id)
+            fut.set_result(ev["text"])
+            return
         self.emit("PrincipalAnswered", query=q)
         self.sched.answer_ready(q)      # 决策 4：作为 pendingAnswer 举手入队，可跨议程插回
         await self._yield_moderator_filler("pendingAnswer")
@@ -828,7 +922,13 @@ class Orchestrator:
         if q and q.status == "pending":
             q.status = "expired"
             self.sm.pending_resolved()
+            self._cancel_waiter(q.id)
             self.emit("PrincipalExpired", query=q)
+
+    def _cancel_waiter(self, query_id: ID) -> None:
+        waiter = self._inline_waiters.pop(query_id, None)
+        if waiter is not None and not waiter[0].done():
+            waiter[0].cancel()
 
     # —— 定时器 ——
     async def _on_timer_floorWarn(self, ev):
@@ -1059,6 +1159,7 @@ class Orchestrator:
             return
         if self.is_bot(tok.holder_id):
             self.voice.interrupt()
+        self._inline_requeue(tok.id)
         self.emit("FloorRevoked", token=tok, reason=reason)
         await self._publish(tok.holder_id, "idle")
         self.token = None
@@ -1143,6 +1244,7 @@ class Orchestrator:
             self._ducks.append({"at": self.now(), "restored": False})
 
     def _record_bot_partial(self, tok: FloorToken, played_chars: int) -> None:
+        self._inline_requeue(tok.id)
         u = Utterance(id=f"utt-{next(self._utt_ids)}", speaker_id=tok.holder_id, agenda_item_id=self.agenda_id,
                       text=i18n_cut_off(getattr(self.m, "language", "zh"), played_chars), started_at=self._turn_started or self.now(),
                       ended_at=self.now(), token_id=tok.id,

@@ -76,6 +76,8 @@ In-meeting questions the stand-in cannot answer use `PrincipalClient` (`orchestr
 
 An explicit `MEETING_PRINCIPAL` always wins over the default.
 
+With `file` or `webhook`, a stand-in that has to ask says "One moment, let me check with my principal", waits up to `MEETING_PRINCIPAL_INLINE_MS`, and reads the reply verbatim ("My principal says: ...") in the same turn. If it is not back in time the stand-in says so and moves on; the reply then arrives the usual way, as a later pending answer. The minutes mark in-turn replies.
+
 Afterward, `meet followup runs/<id>` (or `--room ROOM` for the newest run of a room) writes a prompt per bot from `minutes.md` and `actions/<bot>.json`. Send that prompt to the real bot. Close the loop two ways, both recorded as a `ReconcileResult` event with minutes and actions re-rendered:
 
 - `meet followup runs/<id> --push URL` (default `MEETING_FOLLOWUP_WEBHOOK`) POSTs each prompt and applies a JSON reply.
@@ -149,6 +151,7 @@ Room metadata is readable by everyone holding a token, so it carries only `{"v":
 | `MEETING_PRINCIPAL` | `defer` for `meet` meetings, `mock` for samples | `defer` `mock` `file` `webhook` |
 | `MEETING_PRINCIPAL_DIR` / `MEETING_PRINCIPAL_WEBHOOK` | `runs/principal` / empty | For `file` and `webhook` |
 | `MEETING_PRINCIPAL_DELAY_MS` | `20000` | Delay of the `mock` reply |
+| `MEETING_PRINCIPAL_INLINE_MS` | `5000` | How long a stand-in waits for its principal inside the same turn (`file`/`webhook`; `0` = off). `MEETING_PRINCIPAL_MOCK_INLINE=1` lets `mock` do it too |
 | `MEETING_SCORER` | `rule` | `rule`, or `llm` to add an async LLM re-scorer for raised hands |
 | `MEETING_FOLLOWUP_WEBHOOK` | empty | Default `--push` URL for `meet followup` |
 | `MEETING_BOTS` | `./bots.yaml` | Registry of bots and context |

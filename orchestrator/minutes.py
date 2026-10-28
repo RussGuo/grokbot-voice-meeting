@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .events import EventLog, MeetingEvent
-from .i18n import minutes_labels, normalize
+from .i18n import inline_tag, minutes_labels, normalize
 
 
 def build(events: Iterable[MeetingEvent]) -> dict:
@@ -28,6 +28,7 @@ def build(events: Iterable[MeetingEvent]) -> dict:
     added_items: list[dict] = []                 # 会中新增的议程项 / 改名 / 入会的 bot（网页控制）
     renamed: dict[str, str] = {}
     joined: list[dict] = []
+    inline_toks: set[str] = set()                # 本体在本轮内当场答复的话轮（PrincipalAnswered inline）
     for e in events:
         d = e.data
         if e.type == "AgendaItemAdded":
@@ -46,12 +47,15 @@ def build(events: Iterable[MeetingEvent]) -> dict:
                                            "score": (h.get("score") or {}).get("total"), "result": "queued"})
             if e.type != "HandRaised":
                 r["result"] = {"HandExpired": "expired", "HandWithdrawn": "withdrawn"}[e.type]
+        elif e.type == "PrincipalAnswered" and d.get("token_id"):
+            (inline_toks.add if d.get("inline") else inline_toks.discard)(d["token_id"])    # requeued 的撤销标记
         elif e.type == "EndConfirm" and d.get("stage") in ("human_command", "confirmed", "timeout"):
             end_by = (e.at, d.get("stage"), d.get("text", ""))
         if e.type == "UtteranceFinal" and not d["utterance"].get("interrupted"):
             u = d["utterance"]
+            tok = u.get("token_id") or ""
             utt.append((e.at, u["speaker_id"], u["agenda_item_id"], u["text"], u.get("provenance"),
-                        src.get(u.get("token_id") or "", "")))
+                        src.get(tok, "") + ("+inline" if tok in inline_toks else "")))
         elif e.type == "DecisionRecorded":
             decisions.append(dict(d["payload"]))
         elif e.type == "DecisionSummarized":     # 后台总结落地：覆盖同一议程项先前记录的兜底文本
@@ -109,7 +113,8 @@ def render_md(b: dict) -> str:
     src_tag = {"handRaise": L["tag_hand"], "pendingAnswer": L["tag_pending"], "human": ""}
     for at, sp, ag, text, prov, source in b["utterances"]:
         tag = L["prov"].format(prov=prov) if prov and prov != "model" else ""
-        tag = src_tag.get(source, "") + tag
+        src, _, inline = source.partition("+")
+        tag = src_tag.get(src, "") + (inline_tag(m.get("language")) if inline else "") + tag
         out.append(L["utt"].format(t=at / 1000, ag=ag, name=n.get(sp, sp), tag=tag, text=text))
     out += ["", L["floor"]]
     out.append(L["hands"].format(n=len(b["hands"]), m=b["hand_grants"]))

@@ -3,6 +3,7 @@
 编排器只依赖 PrincipalClient。四种实现：
 
 - MockPrincipal：测试和离线 demo。延迟后投递一条占位答复，不联网。真实会议里绝不能用（会编造答复）。
+  默认不支持当场答复；inline=True（或 MEETING_PRINCIPAL_MOCK_INLINE=1）时按 delay 当场答，用来演练快路径。
 - DeferPrincipal：只记录问题，会中永不作答；编排器的 TTL 路径把它标成未答，留到纪要里。
   `meet` 建的真实会议默认用它。
 - FilePrincipal：把问题写成 JSON，等真实 bot 把答复文件放回来。
@@ -38,6 +39,10 @@ ScheduleFn = Callable[[Millis, dict], None]
 class PrincipalClient(abc.ABC):
     """In-meeting question channel. ask() returns immediately; the answer is an orchestrator event."""
 
+    # 能否在几秒内当场作答。True 时 worker 才打开「同一轮里问本体」的快路径（Orchestrator.request_principal）；
+    # 永远不答的（defer）必须是 False，否则分身每次都白等满预算再说「还没回」。
+    supports_inline: bool = False
+
     @abc.abstractmethod
     async def ask(self, q: PrincipalQuery) -> None:
         """Fire and forget. Deliver {"type": "principal.answered", "query_id", "text"} via the schedule callback."""
@@ -56,8 +61,10 @@ class MockPrincipal(PrincipalClient):
     """模拟本体：延迟可配，答案来自预置字典或模板。绝不联网。"""
 
     def __init__(self, schedule: ScheduleFn, *, delay_ms: Millis = 20_000,
-                 answers: Optional[dict[ID, str]] = None, never_answer: bool = False, language: str = "zh"):
+                 answers: Optional[dict[ID, str]] = None, never_answer: bool = False, language: str = "zh",
+                 inline: bool = False):
         self.schedule = schedule
+        self.supports_inline = inline
         self.language = language
         self.delay_ms = delay_ms
         self.answers = answers or {}
@@ -85,6 +92,8 @@ def _query_payload(q: PrincipalQuery) -> dict:
 
 class FilePrincipal(PrincipalClient):
     """Drop a question file and poll for the real bot's reply. Never invents an answer."""
+
+    supports_inline = True      # 真实 bot 若在预算内把答复文件放回来，就能当场作答；没回也只是走慢路径
 
     def __init__(self, schedule: ScheduleFn, directory: str | Path, *, poll_s: float = 1.0):
         self.schedule = schedule
@@ -139,7 +148,12 @@ class DeferPrincipal(PrincipalClient):
 
 
 class WebhookPrincipal(PrincipalClient):
-    """POST the question. A JSON body with "text" is the answer; otherwise fall back to the file inbox."""
+    """POST the question. A JSON body with "text" is the answer; otherwise fall back to the file inbox.
+
+    POST 在线程里做，不阻塞事件循环；编排器的当场问路径把 ask() 放在后台任务里等，所以慢 webhook
+    （最长 timeout_s）也不会卡住 VAD / 打断。预算（MEETING_PRINCIPAL_INLINE_MS）之后才到的答复走 pendingAnswer 慢路径。"""
+
+    supports_inline = True
 
     def __init__(self, schedule: ScheduleFn, url: str, *, directory: str | Path | None = None, timeout_s: float = 10.0):
         self.schedule = schedule
@@ -208,4 +222,5 @@ def principal_from_env(orch, default: str = "mock") -> PrincipalClient:
         return WebhookPrincipal(deliver, url, directory=os.environ.get("MEETING_PRINCIPAL_DIR") or "runs/principal")
     delay = int(os.environ.get("MEETING_PRINCIPAL_DELAY_MS") or "20000")
     lang = getattr(getattr(orch, "m", None), "language", "zh") or "zh"
-    return MockPrincipal(orch.schedule_timer, delay_ms=delay, language=lang)
+    inline = (os.environ.get("MEETING_PRINCIPAL_MOCK_INLINE") or "").strip().lower() in ("1", "true", "yes")
+    return MockPrincipal(orch.schedule_timer, delay_ms=delay, language=lang, inline=inline)
