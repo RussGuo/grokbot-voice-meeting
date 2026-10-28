@@ -11,8 +11,9 @@ from __future__ import annotations
 import itertools
 import re
 from dataclasses import dataclass, field
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
+from . import textsim as _text
 from .models import (
     ID, PRIORITY, Brief, HandRaise, HandScore, MeetingRules, Millis, PrincipalQuery,
 )
@@ -22,21 +23,11 @@ COOLDOWN_MAX_PENALTY = 0.3   # 刚说完时的最大冷却惩罚，15s 线性衰
 
 
 # ———————————————————— 打分 ————————————————————
+# 文本相似度（中文字二元组 + 英文词干）在 textsim.py；这里保留旧名字，外部 import 不变。
 
-def _tokens(text: str) -> set[str]:
-    """中文按字二元组 + 英文按词，粗粒度相似度够规则打分用。"""
-    text = text.lower()
-    words = set(re.findall(r"[a-z0-9_]+", text))
-    han = re.sub(r"[^\u4e00-\u9fff]", "", text)
-    bigrams = {han[i:i + 2] for i in range(len(han) - 1)}
-    return words | bigrams
-
-
-def similarity(a: str, b: str) -> float:
-    ta, tb = _tokens(a), _tokens(b)
-    if not ta or not tb:
-        return 0.0
-    return len(ta & tb) / min(len(ta), len(tb))
+_tokens = _text.tokens
+similarity = _text.similarity
+_fact_terms = _text.fact_terms
 
 
 def cooldown_penalty(last_spoke_end: Optional[Millis], now: Millis, rules: MeetingRules) -> float:
@@ -66,28 +57,63 @@ def should_raise(score: HandScore, rules: MeetingRules) -> bool:
     return score.total >= rules.hand_threshold
 
 
+class _BriefIndex:
+    """单个 brief 的预处理结果（词集合、事实词），评分时不再重复分词。"""
+
+    def __init__(self, brief: Brief):
+        self.brief = brief
+        self.corpus = _text.tokens(" ".join(brief.keywords + [p.stance for p in brief.positions]))
+        self.facts = [(f, _fact_terms(f.key, f.value)) for f in brief.memory_snapshot.facts]
+
+
 class RuleScorer:
     """规则打分器：编排器内对每个分身批量打分（单 session 下不为每个 bot 跑主 LLM）。
 
-    TODO(待验证)：相关度可换成小模型 / embedding；这里用字二元组重叠做原型。
+    相关度 = 与 brief 的词重叠（中文字二元组 / 英文去停用词词干）+ 关键词命中；
+    置信度 = 能否引用快照事实；新信息量 = 与本议程项已说内容的差异。
+    TODO(待验证)：相关度可换成小模型 / embedding；LLM 批量打分见 scoring.LlmBatchScorer。
     """
+
+    async_updates = False        # 规则版没有异步二次打分；scoring.LlmBatchScorer 置 True
 
     def __init__(self, briefs: dict[ID, Brief], aliases: dict[ID, list[str]]):
         self.briefs = briefs
         self.aliases = aliases
+        self._index: dict[ID, _BriefIndex] = {}
+        self._alias_re: dict[ID, Optional[re.Pattern]] = {}
+
+    def _idx(self, bot_id: ID) -> _BriefIndex:
+        brief = self.briefs[bot_id]
+        ix = self._index.get(bot_id)
+        if ix is None or ix.brief is not brief:      # brief 被换过就重建
+            ix = self._index[bot_id] = _BriefIndex(brief)
+        return ix
 
     def addressed(self, bot_id: ID, text: str) -> bool:
-        return any(a and a in text for a in self.aliases.get(bot_id, []))
+        """被点名：汉字别名按子串；英文别名按整词、不分大小写（避免 "Eng" 命中 "engine"）。"""
+        low = text.lower()
+        for a in self.aliases.get(bot_id, []):
+            if not a:
+                continue
+            if _text.has_han(a) or not re.fullmatch(r"[A-Za-z0-9_ .\-]+", a):
+                if a in text:
+                    return True
+            elif re.search(r"(?<![a-z0-9])" + re.escape(a.lower()) + r"(?![a-z0-9])", low):
+                return True
+        return False
 
     def score(self, bot_id: ID, text: str, said_in_item: list[str], penalty: float,
               agenda_item_id: ID = "") -> tuple[HandScore, str]:
-        brief = self.briefs[bot_id]
+        ix = self._idx(bot_id)
+        brief = ix.brief
         pos = next((p for p in brief.positions if p.agenda_item_id == agenda_item_id), None)
-        corpus = " ".join(brief.keywords + [p.stance for p in brief.positions])
-        kw_hits = sum(1 for k in brief.keywords if k in text)
-        relevance = min(1.0, 0.5 * similarity(text, corpus) + 0.25 * kw_hits)
-        facts = brief.memory_snapshot.facts
-        matched = [f for f in facts if any(tok in text for tok in _fact_terms(f.key, f.value))]
+        low = text.lower()
+        words = _text.match_words(text)
+        kw_hits = sum(1 for k in brief.keywords if _text.keyword_hit(k, low, words))
+        relevance = min(1.0, 0.5 * _text.overlap(_text.tokens(text), ix.corpus) + 0.25 * kw_hits)
+        # 命中词多的事实排前面（同数量保持原顺序）
+        hits = [(_text.fact_hits(terms, low, words), f) for f, terms in ix.facts]
+        matched = [f for n, f in sorted((h for h in hits if h[0]), key=lambda h: -h[0])]
         # 置信度：能引用快照 fact 最高；只有本议程项的 brief 立场次之；都没有则低于阈值
         confidence = min(1.0, 0.4 + 0.3 * len(matched)) if matched else (0.6 if pos else 0.3)
         # gist：这个 bot 准备说的要点 = 命中的第一条事实，否则用本议程项立场
@@ -95,10 +121,15 @@ class RuleScorer:
         novelty = 1.0 - max([similarity(gist, s) for s in said_in_item] or [0.0])
         return hand_score(relevance, confidence, novelty, self.addressed(bot_id, text), penalty), gist
 
+    # —— 异步二次打分的钩子（规则版什么都不做）——
+    def bind(self, deliver: Callable[[Millis, dict], None]) -> None:
+        pass
 
-def _fact_terms(key: str, value: str) -> list[str]:
-    terms = [t for t in re.split(r"[._\s/，,]", key) if len(t) >= 2]
-    return terms
+    def submit(self, req) -> None:
+        pass
+
+    def blend(self, rule: HandScore, rule_gist: str, update: dict, penalty: float) -> tuple[HandScore, str]:
+        return rule, rule_gist
 
 
 # ———————————————————— 候选与调度 ————————————————————
