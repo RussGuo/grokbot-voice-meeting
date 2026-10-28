@@ -204,6 +204,40 @@ async def test_interrupted_speech_cancels_producer_and_closes_stream():
     assert chat.closed == 1 and not layer._bg
 
 
+class _StubbornPlanner:
+    """上游无视取消、继续吐字：复现 3.11 下 wait_for 吞掉 cancel 的情形。"""
+
+    async def plan(self, pid, ctx):
+        from orchestrator.planner import PlanStream
+
+        async def gen():
+            i = 0
+            while i < 40:
+                try:
+                    await asyncio.sleep(0.005)
+                except asyncio.CancelledError:
+                    pass                          # 吞掉取消，接着产出
+                i += 1
+                yield "Sentence number %d. " % i
+        return PlanStream(gen(), {"provenance": "brief", "confidence": 0.8, "commitments": [], "addressees": []},
+                          {"path": "llm", "llm": True}, "x")
+
+
+async def test_no_segments_after_speech_done_even_if_upstream_ignores_cancel():
+    sess = _Session(asyncio.Event())             # TTS 卡住不消费
+    layer, events = make_layer(_StubbornPlanner(), sess)
+    await layer.speak("tok-1", "alice", make_ctx())
+    await asyncio.sleep(0.03)
+    h = sess.handles[0]
+    h.interrupted = True
+    h.task.cancel()
+    for cb in h._cbs:
+        cb(h)
+    await asyncio.sleep(0.1)                     # 上游若还在吐字，这段时间里会冒出新的 tts.segment
+    types = [e["type"] for e in events]
+    assert types[-2:] == ["bot.utterance", "tts.done"], types[-5:]
+
+
 async def test_must_ask_no_llm_call_through_speak():
     m, b = make_meeting("en")
     chat = ScriptedChat([hdr() + "\nnever"])

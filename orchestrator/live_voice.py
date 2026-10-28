@@ -67,6 +67,11 @@ class MeetingVoiceLayer(LiveKitVoiceLayer):
         q: asyncio.Queue = asyncio.Queue()
         spoken: list[str] = []
         stat: dict[str, Any] = {"pid": participant_id, "token_id": token_id}
+        finished = False          # 语音已结束（含被打断）：之后一段都不再发
+
+        def still_valid(t: str) -> bool:
+            # 只靠 task.cancel() 不够：3.11 的 wait_for 可能吞掉取消，上游还会再吐几块
+            return not finished and self.token_valid(t)
 
         def send(seg) -> None:
             if not spoken:
@@ -77,7 +82,7 @@ class MeetingVoiceLayer(LiveKitVoiceLayer):
 
         async def producer():
             try:
-                await pump_segments(ps, token_id, self.token_valid, send)
+                await pump_segments(ps, token_id, still_valid, send)
             except Exception:  # noqa: BLE001
                 log.exception("producer")
             finally:
@@ -95,6 +100,8 @@ class MeetingVoiceLayer(LiveKitVoiceLayer):
         handle = self.session.say(tts_text(), add_to_chat_ctx=False)
 
         def _done(h) -> None:
+            nonlocal finished
+            finished = True
             if not task.done():                    # 被打断：语音先结束，别让上游继续烧 token
                 task.cancel()
             stat["total_ms"] = (time.perf_counter() - t0) * 1000
