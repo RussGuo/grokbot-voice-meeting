@@ -40,10 +40,11 @@ from livekit.agents import AgentServer, JobContext  # noqa: E402
 from meet.runtime import join_wait_s, make_run_id, runs_root  # noqa: E402
 from orchestrator.bots import load_example  # noqa: E402
 from orchestrator.config import llm_config, report  # noqa: E402
-from orchestrator.fake_llm import FakeLLM  # noqa: E402
 from orchestrator.orchestrator import Orchestrator, monotonic_ms  # noqa: E402
+from orchestrator.planner import build_planner  # noqa: E402
 from orchestrator.principal import principal_from_env  # noqa: E402
 from orchestrator.scene import load_scene_metadata  # noqa: E402
+from orchestrator.summarize import build_summarizer  # noqa: E402
 
 log = logging.getLogger("voice-meeting")
 logging.basicConfig(level=logging.INFO)
@@ -151,9 +152,11 @@ async def entrypoint(ctx: JobContext):
         chat = DeepSeekChat(lc)
     log.info("LLM：%s（model=%s，thinking=disabled）；ASR=%s；TTS=%s", lc.provider, lc.model,
              cfg.resolve_asr_provider(), cfg.resolve_tts_provider())
+    lang = getattr(meeting, "language", "zh")
+    # 有 key：LLM 规划器决定说什么（护栏在代码里）；没 key：退回 FakeLLM 规则台词
     voice = MeetingVoiceLayer(cfg, session, vad=adapters.make_vad(), room=ctx.room, human_id=human,
-                              planner=FakeLLM(meeting, briefs), chat=chat, moderator_id=mod,
-                              language=getattr(meeting, "language", "zh"))
+                              planner=build_planner(meeting, briefs, chat, lang), chat=chat, moderator_id=mod,
+                              language=lang)
     await session.start(voice.agent_for(mod), room=ctx.room, room_options=room_options(cfg))
     speakers = None
     if os.environ.get("MEETING_MULTI_IDENTITY", "1") != "0":   # 每个 bot 独立参会者 + 独立音轨
@@ -173,7 +176,9 @@ async def entrypoint(ctx: JobContext):
     # 真实会议（meet 的场景）默认不回答本体问题，留给纪要；样例场景（sim）保留 mock。MEETING_PRINCIPAL 显式设置永远优先。
     orch = Orchestrator(meeting, briefs, voice,
                         principal_factory=partial(principal_from_env, default="defer" if scenario == "scene" else "mock"),
-                        clock=lambda: monotonic_ms() - t0)
+                        clock=lambda: monotonic_ms() - t0,
+                        summarizer=build_summarizer(chat, lang),   # 议程结论后台总结；chat 为 None 时只用兜底
+                        scorer_chat=chat)                          # MEETING_SCORER=llm 时才启用二次打分
     voice.token_valid = orch.token_valid
 
     # —— 给网页：领域事件原样转发到 meeting.events；网页按钮经 meeting.control 进来（只认用户）——
@@ -243,6 +248,9 @@ async def entrypoint(ctx: JobContext):
             log.warning("voice.aclose 失败：%s", type(e).__name__)
         try:
             await orch.principal.aclose()   # 取消还在轮询 inbox 的任务
+            close_scorer = getattr(orch.scorer, "aclose", None)
+            if close_scorer is not None:
+                await close_scorer()        # LLM 二次打分可能还有请求在飞
         except Exception as e:  # noqa: BLE001
             log.warning("principal.aclose 失败：%s", type(e).__name__)
         ctx.shutdown(reason="meeting ended")

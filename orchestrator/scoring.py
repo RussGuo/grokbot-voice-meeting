@@ -141,6 +141,13 @@ class LlmBatchScorer(RuleScorer):
         self._latest = req.seq
         self._task = loop.create_task(self._run(req, prev))
 
+    async def aclose(self) -> None:
+        """会议结束：取消还在飞的打分请求。"""
+        t = self._task
+        if t is not None and not t.done():
+            t.cancel()
+            await asyncio.gather(t, return_exceptions=True)
+
     async def wait_idle(self) -> None:
         """测试用：等当前请求结束（含被取消）。"""
         t = self._task
