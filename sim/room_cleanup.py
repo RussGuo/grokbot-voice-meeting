@@ -1,7 +1,9 @@
 """会后删房：python sim/room_cleanup.py --room sim-meeting-01"""
-import argparse, asyncio, os
+import argparse
+import asyncio
+import os
 from livekit import api
-import common  # 读 .env
+import common  # noqa: F401  读 .env（副作用导入）
 async def main(room):
     lk = api.LiveKitAPI(os.environ["LIVEKIT_URL"].replace("wss://", "https://"), os.environ["LIVEKIT_API_KEY"], os.environ["LIVEKIT_API_SECRET"])
     try:

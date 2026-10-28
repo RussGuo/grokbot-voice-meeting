@@ -13,7 +13,6 @@ from _env import load_env
 
 async def build(bot: str):
     from orchestrator.driver import SimDriver
-    from orchestrator.state_machine import Floor
     d = SimDriver()
     await d.start()
     d.say(11_000, f"{d.orch.name(bot)}，离线同步的冲突率和工期怎么样？")

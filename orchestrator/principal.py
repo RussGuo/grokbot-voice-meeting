@@ -46,12 +46,19 @@ class PrincipalClient(abc.ABC):
         """Release background work (polls). Called once at meeting end; default is a no-op."""
 
 
+def _mock_answer(language: str, question: str) -> str:
+    if (language or "zh").lower().startswith("en"):
+        return f'(Simulated principal reply) On "{question}": going by the principal\'s memory, the conclusion is pending written confirmation after the meeting.'
+    return f"（模拟本体答复）关于「{question}」：按本体记忆，结论待会后书面确认。"
+
+
 class MockPrincipal(PrincipalClient):
     """模拟本体：延迟可配，答案来自预置字典或模板。绝不联网。"""
 
     def __init__(self, schedule: ScheduleFn, *, delay_ms: Millis = 20_000,
-                 answers: Optional[dict[ID, str]] = None, never_answer: bool = False):
+                 answers: Optional[dict[ID, str]] = None, never_answer: bool = False, language: str = "zh"):
         self.schedule = schedule
+        self.language = language
         self.delay_ms = delay_ms
         self.answers = answers or {}
         self.never_answer = never_answer
@@ -61,7 +68,7 @@ class MockPrincipal(PrincipalClient):
         self.asked.append(q)
         if self.never_answer:
             return
-        text = self.answers.get(q.principal_bot_id) or f"（模拟本体答复）关于「{q.question}」：按本体记忆，结论待会后书面确认。"
+        text = self.answers.get(q.principal_bot_id) or _mock_answer(self.language, q.question)
         self.schedule(self.delay_ms, {"type": "principal.answered", "query_id": q.id, "text": text})
 
 
@@ -200,4 +207,5 @@ def principal_from_env(orch, default: str = "mock") -> PrincipalClient:
             raise RuntimeError("MEETING_PRINCIPAL=webhook requires MEETING_PRINCIPAL_WEBHOOK")
         return WebhookPrincipal(deliver, url, directory=os.environ.get("MEETING_PRINCIPAL_DIR") or "runs/principal")
     delay = int(os.environ.get("MEETING_PRINCIPAL_DELAY_MS") or "20000")
-    return MockPrincipal(orch.schedule_timer, delay_ms=delay)
+    lang = getattr(getattr(orch, "m", None), "language", "zh") or "zh"
+    return MockPrincipal(orch.schedule_timer, delay_ms=delay, language=lang)

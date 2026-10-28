@@ -1,10 +1,11 @@
 """sim/ 共用：读 .env、签 token（不打印任何密钥）。"""
-import os, time
+import os
+import time
 from pathlib import Path
 from dotenv import load_dotenv
 ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT / ".env")
-from livekit import api
+from livekit import api  # noqa: E402  load_dotenv 之后再导入
 
 AGENT_NAME = os.environ.get("LIVEKIT_AGENT_NAME", "voice-meeting")
 HUMAN_ID = os.environ.get("MEETING_HUMAN_IDENTITY", "host")

@@ -21,4 +21,5 @@ python token_server.py   # 仅监听 127.0.0.1:8787
 - 房间 metadata 对所有持 token 的参会者可见，所以 `meet` 只往里写 `{"v":1,"room":{"topic","who"}}`；完整场景（含 brief）只走派发 metadata，并存在 `links/<room>.scene.json`（600）。链接可以转发，brief 不会随链接泄露。
 - 用户的 identity 默认取环境变量 `MEETING_HUMAN_IDENTITY`（缺省 `host`），与编排器一致；URL 参数 `identity` 可覆盖。
 - token 服务默认只绑 127.0.0.1；room/identity 做了白名单校验；密钥只读环境变量。
+- 设了 `MEETING_ACCESS_KEY` 即「公网模式」：口令用 `Authorization: Bearer <key>` 头，或首访后下发的 HttpOnly cookie；旧的 `?k=<key>` 仍可用但不推荐（会留在地址栏、浏览器历史和代理日志里）。访问日志只记路径，不记查询串，口令不会写进日志。
 - 需要别的设备访问时，走 SSH 隧道或带鉴权的反代，不要直接把 8787 暴露到公网。

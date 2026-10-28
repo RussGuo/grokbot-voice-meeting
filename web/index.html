@@ -122,7 +122,8 @@ a { color:var(--blue); }
 <div id="minutes"><button class="close" id="minclose">关闭</button><h3>会后纪要</h3><div id="minbody"></div></div>
 
 <script type="module">
-import { Room, RoomEvent, Track } from "https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.esm.mjs";
+// 精确版本，不跟浮动的 @2。ES module 的 import 不支持 SRI integrity；升级时手动改这里并回归一次入会。
+import { Room, RoomEvent, Track } from "https://cdn.jsdelivr.net/npm/livekit-client@2.22.4/dist/livekit-client.esm.mjs";
 
 /* 数据约定（编排器 -> 网页）
  *  meeting.events  : 编排器领域事件原样转发，与 runs/<run>/events.jsonl 每行同构 {type, at, seq, data}

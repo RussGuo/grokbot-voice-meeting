@@ -7,7 +7,10 @@
 - on_speaking：收到 meeting.speaker state=speaking（且 speaker 不是自己）后延迟 delay_ms 开口（=插话测试）；
   after_ms 表示进房多久后才开始等待该触发
 开口/说完时间写进 <out>/sim_human.jsonl。"""
-import argparse, asyncio, json, wave, time
+import argparse
+import asyncio
+import json
+import wave
 from pathlib import Path
 import numpy as np
 from livekit import rtc

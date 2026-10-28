@@ -1,6 +1,7 @@
 """从 runs/<dir> 计算插话延迟：模拟人类开口(在房间里收到的 host 音轨首个高能量帧) -> bot 音轨压低/静音。
 用法: python sim/bargein.py runs/<dir> [--speech-db -40] [--silence-db -50]"""
-import argparse, json
+import argparse
+import json
 from collections import defaultdict
 from pathlib import Path
 from common import HUMAN_ID
