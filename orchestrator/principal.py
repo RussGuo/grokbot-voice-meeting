@@ -1,8 +1,10 @@
 """askPrincipal：会中慢路径，向真实 bot（本体）异步提问。
 
-编排器只依赖 PrincipalClient。三种实现：
+编排器只依赖 PrincipalClient。四种实现：
 
-- MockPrincipal：测试和离线 demo。延迟后投递一条占位答复，不联网。
+- MockPrincipal：测试和离线 demo。延迟后投递一条占位答复，不联网。真实会议里绝不能用（会编造答复）。
+- DeferPrincipal：只记录问题，会中永不作答；编排器的 TTL 路径把它标成未答，留到纪要里。
+  `meet` 建的真实会议默认用它。
 - FilePrincipal：把问题写成 JSON，等真实 bot 把答复文件放回来。
   目录布局（MEETING_PRINCIPAL=file，MEETING_PRINCIPAL_DIR）：
     outbox/<query_id>.json   编排器写出的问题
@@ -18,6 +20,7 @@ from __future__ import annotations
 import abc
 import asyncio
 import json
+import logging
 import os
 import urllib.error
 import urllib.request
@@ -25,6 +28,8 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .models import ID, Millis, PrincipalQuery
+
+log = logging.getLogger(__name__)
 
 # 编排器提供的定时投递函数：schedule(delay_ms, event_dict)
 ScheduleFn = Callable[[Millis, dict], None]
@@ -36,6 +41,9 @@ class PrincipalClient(abc.ABC):
     @abc.abstractmethod
     async def ask(self, q: PrincipalQuery) -> None:
         """Fire and forget. Deliver {"type": "principal.answered", "query_id", "text"} via the schedule callback."""
+
+    async def aclose(self) -> None:
+        """Release background work (polls). Called once at meeting end; default is a no-op."""
 
 
 class MockPrincipal(PrincipalClient):
@@ -76,13 +84,24 @@ class FilePrincipal(PrincipalClient):
         self.directory = Path(directory)
         self.poll_s = poll_s
         self.asked: list[PrincipalQuery] = []
+        self._tasks: set[asyncio.Task] = set()      # 事件循环只持弱引用，轮询任务必须自己拿住
 
     async def ask(self, q: PrincipalQuery) -> None:
         self.asked.append(q)
         out = self.directory / "outbox"
         out.mkdir(parents=True, exist_ok=True)
         (out / f"{q.id}.json").write_text(json.dumps(_query_payload(q), ensure_ascii=False, indent=2), encoding="utf-8")
-        asyncio.create_task(self._poll(q))
+        task = asyncio.create_task(self._poll(q))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def aclose(self) -> None:
+        """Cancel outstanding polls (meeting over)."""
+        tasks = list(self._tasks)
+        for t in tasks:
+            t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _poll(self, q: PrincipalQuery) -> None:
         inbox = self.directory / "inbox" / f"{q.id}.json"
@@ -98,6 +117,18 @@ class FilePrincipal(PrincipalClient):
                     self.schedule(0, {"type": "principal.answered", "query_id": q.id, "text": text})
                     return
             await asyncio.sleep(self.poll_s)
+
+
+class DeferPrincipal(PrincipalClient):
+    """Never answers in the meeting. The orchestrator's TTL timer marks the query expired and the question
+    lands in the minutes for a post-meeting follow-up. The honest default when no real bot is wired up."""
+
+    def __init__(self) -> None:
+        self.asked: list[PrincipalQuery] = []
+
+    async def ask(self, q: PrincipalQuery) -> None:
+        self.asked.append(q)
+        log.info("principal question deferred to the minutes: %s (%s)", q.id, q.asked_by)
 
 
 class WebhookPrincipal(PrincipalClient):
@@ -134,6 +165,9 @@ class WebhookPrincipal(PrincipalClient):
             return
         await self.files.ask(q)
 
+    async def aclose(self) -> None:
+        await self.files.aclose()
+
 
 def deliver_to(orch) -> ScheduleFn:
     """Prefer the live inbox so a late answer is not stuck behind the current timer wait."""
@@ -146,10 +180,18 @@ def deliver_to(orch) -> ScheduleFn:
     return deliver
 
 
-def principal_from_env(orch) -> PrincipalClient:
-    """MEETING_PRINCIPAL=mock|file|webhook. Default mock, which is what tests and `meet demo` use."""
-    kind = (os.environ.get("MEETING_PRINCIPAL") or "mock").strip().lower()
+PRINCIPAL_KINDS = ("mock", "file", "webhook", "defer")
+
+
+def principal_from_env(orch, default: str = "mock") -> PrincipalClient:
+    """MEETING_PRINCIPAL=mock|file|webhook|defer always wins. Otherwise `default`: mock for the sample
+    scenarios (sim, `meet demo`, tests), defer for real meetings built from a `meet` scene."""
+    kind = (os.environ.get("MEETING_PRINCIPAL") or default or "mock").strip().lower()
+    if kind not in PRINCIPAL_KINDS:
+        raise ValueError(f"MEETING_PRINCIPAL must be one of {'|'.join(PRINCIPAL_KINDS)}, got {kind!r}")
     deliver = deliver_to(orch)
+    if kind == "defer":
+        return DeferPrincipal()
     if kind == "file":
         return FilePrincipal(deliver, os.environ.get("MEETING_PRINCIPAL_DIR") or "runs/principal")
     if kind == "webhook":
