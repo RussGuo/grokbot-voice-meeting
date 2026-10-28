@@ -26,8 +26,9 @@ from .models import (
     ID, Brief, ChatCtxRecipe, Commitment, FloorToken, Meeting, Millis,
     PrincipalAnswer, PrincipalQuery, Utterance,
 )
-from .principal import PrincipalClient
-from .scheduler import Candidate, Cue, RuleScorer, Scheduler, cooldown_penalty
+from .principal import PrincipalClient, deliver_to
+from .scheduler import Candidate, Cue, Scheduler, cooldown_penalty
+from .scoring import BotCtx, ScoreRequest, build_scorer
 from .state_machine import Floor, MeetingStateMachine, Phase
 from .voice_iface import VoiceLayer
 
@@ -38,7 +39,7 @@ log = logging.getLogger("orchestrator")
 class Orchestrator:
     def __init__(self, meeting: Meeting, briefs: dict[ID, Brief], voice: VoiceLayer,
                  principal_factory: Callable[["Orchestrator"], PrincipalClient],
-                 clock: Callable[[], Millis], log_path=None):
+                 clock: Callable[[], Millis], log_path=None, scorer_chat: Any = None):
         self.m = meeting
         self.briefs = briefs
         self.voice = voice
@@ -52,7 +53,14 @@ class Orchestrator:
         if self.human_id not in humans:
             raise ValueError(f"linked_human_id={self.human_id} 不在参会者里（必须等于用户的 LiveKit identity）")
         self.sched = Scheduler(self.rules, humans, self.moderator_id)
-        self.scorer = RuleScorer(briefs, {p.id: p.aliases + [p.display_name] for p in meeting.participants})
+        # 打分器：MEETING_SCORER=rule（默认）| llm。llm 需要 scorer_chat（有 astream_text 的 LLM 客户端），
+        # 缺省则退回规则版；结果以 scorer.update 事件投回 inbox（与 principal.answered 同一条路）。
+        self.scorer = build_scorer(briefs, {p.id: p.aliases + [p.display_name] for p in meeting.participants},
+                                   chat=scorer_chat)
+        self.scorer.bind(deliver_to(self))
+        self._scorer_ctx: Optional[tuple[int, ID, str, ID]] = None   # (seq, 议程项, 发言, 说话人)：最近一次 fan-out
+        self._rule_hands: dict[ID, ID] = {}                          # bot -> 该次 fan-out 里规则分举的手
+        self._scorer_applied = -1
         self.principal = principal_factory(self)
 
         self.token: Optional[FloorToken] = None
@@ -834,11 +842,18 @@ class Orchestrator:
         self.minutes.append(f"{self.name(u.speaker_id)}：{u.text}")
         self._fan_out(u)
 
-    def _fan_out(self, u: Utterance) -> None:
-        """把最新发言推给各分身打分器；达到阈值即举手。"""
+    def _said_in_item(self, agenda_item_id: ID) -> list[str]:
         # 「已说内容」只算成员 bot 的实质发言（主持人的程序性发言、人类提问不算）
-        said = [x.text for x in self.utterances if x.agenda_item_id == u.agenda_item_id
+        return [x.text for x in self.utterances if x.agenda_item_id == agenda_item_id
                 and x.speaker_id not in (self.human_id, self.moderator_id) and not x.interrupted]
+
+    def _fan_out(self, u: Utterance) -> None:
+        """把最新发言推给各分身打分器；达到阈值即举手。LLM 模式下另发一次异步二次打分（不阻塞）。"""
+        said = self._said_in_item(u.agenda_item_id)
+        seq = self.log.last_seq
+        self._scorer_ctx = (seq, u.agenda_item_id, u.text, u.speaker_id)
+        self._rule_hands = {}
+        scored: list[BotCtx] = []
         for p in self.m.participants:
             if p.kind != "bot" or p.id in (u.speaker_id, self.moderator_id) or p.id not in self.briefs:
                 continue
@@ -849,6 +864,49 @@ class Orchestrator:
                 self.emit("HandWithdrawn", hand=replaced)
             if hand:
                 self.emit("HandRaised", hand=hand)
+                self._rule_hands[p.id] = hand.id
+            if not score.addressed:           # 被点名的直接举手，不需要二次打分
+                scored.append(BotCtx(p.id, p.display_name, score, gist))
+        if self.scorer.async_updates and scored:
+            recent = [(self.name(x.speaker_id), x.text) for x in self.utterances[-4:]
+                      if x.agenda_item_id == u.agenda_item_id]
+            self.scorer.submit(ScoreRequest(seq, u.agenda_item_id, u.text, u.speaker_id, scored, said, recent))
+
+    async def _on_scorer_update(self, ev):
+        """LLM 批量打分结果：丢弃过期的（已有更新的发言 / 议程项已换），否则重算 S，补举手、替换或撤回。"""
+        ctx = self._scorer_ctx
+        if (ctx is None or ev.get("based_on_seq") != ctx[0] or ev.get("agenda_item_id") != ctx[1]
+                or ctx[1] != self.agenda_id or ctx[0] == self._scorer_applied
+                or self.sm.phase != Phase.IN_AGENDA):
+            return
+        self._scorer_applied = ctx[0]
+        _, agenda, text, speaker = ctx
+        said = self._said_in_item(agenda)
+        raised = False
+        for pid, upd in (ev.get("scores") or {}).items():
+            if (pid not in self.briefs or pid in (speaker, self.moderator_id) or not self.is_bot(pid)
+                    or (self.token is not None and self.token.holder_id == pid)):
+                continue
+            old = next((h for h in self.sched.s.hands if h.id == self._rule_hands.get(pid)), None)
+            if pid in self._rule_hands and old is None:
+                continue                      # 规则分那次的手已被授予 / 过期：这个 bot 对这句话已经行动过了
+            pen = cooldown_penalty(self.sched.s.last_spoke_end.get(pid), self.now(), self.rules)
+            rule, rgist = self.scorer.score(pid, text, said, pen, agenda)
+            if rule.addressed:
+                continue
+            score, gist = self.scorer.blend(rule, rgist, upd, pen)
+            if old is not None:
+                self.sched.withdraw(pid)      # 旧手按新分数重新裁决，避免去重分支保留更高的规则分
+            hand, replaced = self.sched.raise_hand(pid, agenda, score, gist, self.now(), self.log.last_seq)
+            gone = old or replaced
+            if gone is not None:
+                self.emit("HandWithdrawn", hand=gone)
+            if hand:
+                self.emit("HandRaised", hand=hand)
+                self._rule_hands[pid] = hand.id
+                raised = True
+        if raised and self.token is None:
+            await self.schedule()             # 话轮空闲时新举的手要立刻参与挑选
 
     def _mark_duck(self, tok: FloorToken, restored: bool = False) -> None:
         if restored and self._ducks:
