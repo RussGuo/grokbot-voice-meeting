@@ -1,0 +1,12 @@
+.venv/
+models/
+bin/
+__pycache__/
+*.pyc
+bench/out/
+.pytest_cache/
+
+# 试听样本（音频）不入库
+samples/*.wav
+*.wav
+.env

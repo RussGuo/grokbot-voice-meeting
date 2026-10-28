@@ -1,0 +1,57 @@
+{
+  "_note": "示例数据（虚构），不代表任何真实公司",
+  "participant_id": "chief_of_staff",
+  "agenda_item_ids": [
+    "v1-1",
+    "v1-2"
+  ],
+  "keywords": [
+    "节奏",
+    "优先级",
+    "风险",
+    "跟进"
+  ],
+  "positions": [
+    {
+      "agenda_item_id": "v1-1",
+      "stance": "建议 v1 先补齐对账与慢路径，多音轨放 v1.1。",
+      "evidence": []
+    },
+    {
+      "agenda_item_id": "v1-2",
+      "stance": "两周一个里程碑，成本超线就暂停扩量。",
+      "evidence": []
+    }
+  ],
+  "questions_for_others": [],
+  "memory_snapshot": {
+    "topic": "多 Bot 语音会议插件 v1",
+    "facts": [
+      {
+        "key": "plan.里程碑",
+        "value": "示例数据：v1 目标在 11 月底前内测（虚构）",
+        "source": "示例资料",
+        "as_of": "2026-10-27"
+      }
+    ],
+    "open_todos": [],
+    "recent_decisions": [
+      "MVP 用单 AgentSession + update_agent（示例）"
+    ],
+    "red_lines": [
+      "不代替用户做预算决定"
+    ],
+    "exported_at": "2026-10-27T22:00:00+08:00",
+    "token_estimate": 300
+  },
+  "mandate": {
+    "can_commit": [
+      "整理会议纪要",
+      "安排会后跟进"
+    ],
+    "must_ask": [
+      "预算",
+      "发布日期"
+    ]
+  }
+}

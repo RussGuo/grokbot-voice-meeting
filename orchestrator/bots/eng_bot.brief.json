@@ -1,0 +1,25 @@
+{
+  "_note": "示例数据（虚构）",
+  "participant_id": "eng_bot",
+  "agenda_item_ids": ["ag-1", "ag-2"],
+  "keywords": ["同步", "冲突", "工期", "成本", "灰度", "摘要", "技术"],
+  "positions": [
+    {"agenda_item_id": "ag-1", "stance": "离线同步可以做，但冲突合并要先做技术评估，建议放 v2.1。", "evidence": ["sync.冲突率"]},
+    {"agenda_item_id": "ag-2", "stance": "AI 摘要灰度要先压推理成本，建议先 1% 灰度。", "evidence": ["cost.推理成本"]}
+  ],
+  "questions_for_others": [{"to": "pm_bot", "q": "离线同步是不是必须首发？"}],
+  "memory_snapshot": {
+    "topic": "「轻记」v2.0 路线",
+    "facts": [
+      {"key": "sync.冲突率", "value": "示例数据：原型里多端离线编辑的冲突率约 3%（虚构）", "source": "示例原型测试", "as_of": "2026-10-18"},
+      {"key": "sync.工期", "value": "示例数据：冲突合并预估 4 人周（虚构）", "source": "示例排期", "as_of": "2026-10-21"},
+      {"key": "cost.推理成本", "value": "示例数据：摘要单次推理成本仍偏高，需先做缓存（虚构）", "source": "示例成本测算", "as_of": "2026-10-23"}
+    ],
+    "open_todos": [{"title": "离线同步技术评估"}],
+    "recent_decisions": ["同步协议沿用现有增量方案（示例）"],
+    "red_lines": ["不承诺外包合同"],
+    "exported_at": "2026-10-27T21:00:00+08:00",
+    "token_estimate": 480
+  },
+  "mandate": {"can_commit": ["出技术评估", "做原型"], "must_ask": ["外包合同", "招聘"]}
+}

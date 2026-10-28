@@ -1,0 +1,130 @@
+{
+  "_note": "示例数据：议题「多 Bot 语音会议插件 v1 先做什么」，2 个议程项，总时长 ≤5 分钟；所有数字均为虚构。",
+  "id": "mtg-sim-v1",
+  "title": "多 Bot 语音会议插件 v1 先做什么（示例）",
+  "initiator": "__HUMAN__",
+  "moderator": {
+    "mode": "chiefOfStaff",
+    "participant_id": "chief_of_staff"
+  },
+  "rules": {
+    "total_ms": 300000,
+    "opening_round": true
+  },
+  "agenda": [
+    {
+      "id": "v1-1",
+      "title": "v1 首要功能：多音轨、会后对账还是本体慢路径",
+      "owner_id": "pm_bot",
+      "timebox_ms": 150000,
+      "goal": "decide",
+      "keywords": [
+        "多音轨",
+        "对账",
+        "慢路径",
+        "功能"
+      ]
+    },
+    {
+      "id": "v1-2",
+      "title": "上线节奏与成本",
+      "owner_id": "growth_bot",
+      "timebox_ms": 120000,
+      "goal": "discuss",
+      "keywords": [
+        "成本",
+        "节奏",
+        "上线",
+        "额度"
+      ]
+    }
+  ],
+  "participants": [
+    {
+      "id": "__HUMAN__",
+      "kind": "human",
+      "display_name": "用户",
+      "role": "member",
+      "aliases": [
+        "用户"
+      ]
+    },
+    {
+      "id": "chief_of_staff",
+      "kind": "bot",
+      "display_name": "Chief of Staff",
+      "role": "moderator",
+      "aliases": [
+        "Chief of Staff",
+        "幕僚长"
+      ],
+      "principal_ref": {
+        "bot_id": "principal-chief-of-staff",
+        "channel": "mcp"
+      },
+      "agent_profile": {
+        "tts_voice": "voice_cos_female_crisp",
+        "llm": "deepseek",
+        "instructions": "你是 Chief of Staff 的语音分身，兼任主持：开场声明有立场，按议程推进，小结中立。"
+      }
+    },
+    {
+      "id": "pm_bot",
+      "kind": "bot",
+      "display_name": "产品分身",
+      "role": "member",
+      "aliases": [
+        "产品分身",
+        "产品"
+      ],
+      "principal_ref": {
+        "bot_id": "principal-pm",
+        "channel": "mcp"
+      },
+      "agent_profile": {
+        "tts_voice": "voice_pm_female_warm",
+        "llm": "deepseek",
+        "instructions": "你是产品负责人 bot 的语音分身，关注用户价值。"
+      }
+    },
+    {
+      "id": "eng_bot",
+      "kind": "bot",
+      "display_name": "工程分身",
+      "role": "member",
+      "aliases": [
+        "工程分身",
+        "工程"
+      ],
+      "principal_ref": {
+        "bot_id": "principal-eng",
+        "channel": "mcp"
+      },
+      "agent_profile": {
+        "tts_voice": "voice_eng_male_calm",
+        "llm": "deepseek",
+        "instructions": "你是工程负责人 bot 的语音分身，关注可行性、延迟与成本。"
+      }
+    },
+    {
+      "id": "growth_bot",
+      "kind": "bot",
+      "display_name": "增长分身",
+      "role": "member",
+      "aliases": [
+        "增长分身",
+        "增长",
+        "运营"
+      ],
+      "principal_ref": {
+        "bot_id": "principal-growth",
+        "channel": "mcp"
+      },
+      "agent_profile": {
+        "tts_voice": "voice_growth_male_bright",
+        "llm": "deepseek",
+        "instructions": "你是增长/运营负责人 bot 的语音分身，关注试用、留存与推广。"
+      }
+    }
+  ]
+}

@@ -1,0 +1,68 @@
+{
+  "_note": "示例数据（虚构），不代表任何真实公司",
+  "participant_id": "pm_bot",
+  "agenda_item_ids": [
+    "v1-1",
+    "v1-2"
+  ],
+  "keywords": [
+    "功能",
+    "对账",
+    "用户",
+    "多音轨",
+    "需求"
+  ],
+  "positions": [
+    {
+      "agenda_item_id": "v1-1",
+      "stance": "v1 先做会后对账，让分身的承诺可追溯，这是信任的基础。",
+      "evidence": []
+    },
+    {
+      "agenda_item_id": "v1-2",
+      "stance": "先内测两周再扩大。",
+      "evidence": []
+    }
+  ],
+  "questions_for_others": [
+    {
+      "to": "eng_bot",
+      "q": "多音轨要多久？"
+    }
+  ],
+  "memory_snapshot": {
+    "topic": "多 Bot 语音会议插件 v1",
+    "facts": [
+      {
+        "key": "feedback.对账",
+        "value": "示例数据：内测反馈里约六成关心承诺能否追溯（虚构）",
+        "source": "示例资料",
+        "as_of": "2026-10-27"
+      },
+      {
+        "key": "plan.内测",
+        "value": "示例数据：计划邀请 20 位内测用户（虚构）",
+        "source": "示例资料",
+        "as_of": "2026-10-27"
+      }
+    ],
+    "open_todos": [],
+    "recent_decisions": [
+      "MVP 用单 AgentSession + update_agent（示例）"
+    ],
+    "red_lines": [
+      "不对外承诺发布日期"
+    ],
+    "exported_at": "2026-10-27T22:00:00+08:00",
+    "token_estimate": 300
+  },
+  "mandate": {
+    "can_commit": [
+      "整理需求文档",
+      "约用户访谈"
+    ],
+    "must_ask": [
+      "对外发布日期"
+    ]
+  }
+}

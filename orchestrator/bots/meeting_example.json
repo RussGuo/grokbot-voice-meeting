@@ -1,0 +1,123 @@
+{
+  "_note": "示例数据：虚构产品「轻记」笔记 App 的路线讨论，所有数字均为虚构，不代表任何真实公司。v0 默认由 Chief of Staff 分身兼任主持；中立主持人见 moderator_options.neutral（可选）。",
+  "id": "mtg-demo-001",
+  "title": "「轻记」v2.0 路线评审（示例）",
+  "initiator": "__HUMAN__",
+  "agenda": [
+    {
+      "id": "ag-1",
+      "title": "离线同步是否进 v2.0",
+      "owner_id": "pm_bot",
+      "timebox_ms": 90000,
+      "goal": "decide",
+      "keywords": [
+        "离线",
+        "同步",
+        "冲突"
+      ]
+    },
+    {
+      "id": "ag-2",
+      "title": "AI 摘要灰度节奏",
+      "owner_id": "eng_bot",
+      "timebox_ms": 90000,
+      "goal": "discuss",
+      "keywords": [
+        "摘要",
+        "灰度",
+        "成本"
+      ]
+    }
+  ],
+  "participants": [
+    {
+      "id": "__HUMAN__",
+      "kind": "human",
+      "display_name": "用户",
+      "role": "member",
+      "aliases": [
+        "用户"
+      ]
+    },
+    {
+      "id": "chief_of_staff",
+      "kind": "bot",
+      "display_name": "Chief of Staff",
+      "role": "moderator",
+      "aliases": [
+        "Chief of Staff",
+        "幕僚长"
+      ],
+      "principal_ref": {
+        "bot_id": "principal-chief-of-staff",
+        "channel": "mcp"
+      },
+      "agent_profile": {
+        "tts_voice": "voice_cos_female_crisp",
+        "llm": "deepseek",
+        "instructions": "你是用户的 Chief of Staff bot 的语音分身，兼任本场主持：开场声明自己有立场；按议程推进、cue 发言少的人、小结要中立，决策宣读用中立模板。"
+      }
+    },
+    {
+      "id": "pm_bot",
+      "kind": "bot",
+      "display_name": "产品分身",
+      "role": "member",
+      "aliases": [
+        "产品分身",
+        "产品"
+      ],
+      "principal_ref": {
+        "bot_id": "principal-pm",
+        "channel": "mcp"
+      },
+      "agent_profile": {
+        "tts_voice": "voice_pm_female_warm",
+        "llm": "deepseek",
+        "instructions": "你是产品负责人 bot 的语音分身，代表它参会，关注用户价值与上线节奏。"
+      }
+    },
+    {
+      "id": "eng_bot",
+      "kind": "bot",
+      "display_name": "工程分身",
+      "role": "member",
+      "aliases": [
+        "工程分身",
+        "工程"
+      ],
+      "principal_ref": {
+        "bot_id": "principal-eng",
+        "channel": "mcp"
+      },
+      "agent_profile": {
+        "tts_voice": "voice_eng_male_calm",
+        "llm": "deepseek",
+        "instructions": "你是工程负责人 bot 的语音分身，代表它参会，关注可行性、风险与成本。"
+      }
+    }
+  ],
+  "moderator": {
+    "mode": "chiefOfStaff",
+    "participant_id": "chief_of_staff"
+  },
+  "moderator_options": {
+    "neutral": {
+      "moderator": {
+        "mode": "neutral",
+        "participant_id": "moderator"
+      },
+      "participant": {
+        "id": "moderator",
+        "kind": "bot",
+        "display_name": "主持人",
+        "role": "moderator",
+        "agent_profile": {
+          "tts_voice": "voice_moderator_neutral",
+          "llm": "deepseek",
+          "instructions": "你是中立主持人，没有立场，只按议程、规则和共享纪要主持：开场、cue、小结、回溯、宣读决策。"
+        }
+      }
+    }
+  }
+}

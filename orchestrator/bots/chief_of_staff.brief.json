@@ -1,0 +1,77 @@
+{
+  "_note": "示例数据（虚构）",
+  "participant_id": "chief_of_staff",
+  "agenda_item_ids": [
+    "ag-1",
+    "ag-2"
+  ],
+  "keywords": [
+    "节奏",
+    "优先级",
+    "风险",
+    "跟进",
+    "纪要"
+  ],
+  "positions": [
+    {
+      "agenda_item_id": "ag-1",
+      "stance": "建议 v2.0 先做离线只读，写入同步放 v2.1，兼顾节奏与风险。",
+      "evidence": [
+        "plan.里程碑"
+      ]
+    },
+    {
+      "agenda_item_id": "ag-2",
+      "stance": "摘要灰度跟着成本走，成本达标前不扩量。",
+      "evidence": [
+        "plan.风险"
+      ]
+    }
+  ],
+  "questions_for_others": [
+    {
+      "to": "eng_bot",
+      "q": "离线只读能不能赶上 v2.0？"
+    }
+  ],
+  "memory_snapshot": {
+    "topic": "「轻记」v2.0 路线",
+    "facts": [
+      {
+        "key": "plan.里程碑",
+        "value": "示例数据：v2.0 代码冻结在 11 月下旬（虚构）",
+        "source": "示例项目计划",
+        "as_of": "2026-10-25"
+      },
+      {
+        "key": "plan.风险",
+        "value": "示例数据：本季度同时在推 3 个项目，人手偏紧（虚构）",
+        "source": "示例周报",
+        "as_of": "2026-10-26"
+      }
+    ],
+    "open_todos": [
+      {
+        "title": "会后分发纪要与行动项"
+      }
+    ],
+    "recent_decisions": [
+      "每周一路线同步（示例）"
+    ],
+    "red_lines": [
+      "不代替用户做预算决定"
+    ],
+    "exported_at": "2026-10-27T21:00:00+08:00",
+    "token_estimate": 360
+  },
+  "mandate": {
+    "can_commit": [
+      "整理会议纪要",
+      "安排会后跟进"
+    ],
+    "must_ask": [
+      "预算",
+      "发布日期"
+    ]
+  }
+}

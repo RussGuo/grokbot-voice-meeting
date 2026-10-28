@@ -1,0 +1,8 @@
+livekit-agents==1.8.9
+livekit-plugins-silero==1.8.9
+livekit-plugins-openai==1.8.9
+livekit-api
+sherpa-onnx==2.0.1   # 本地回退 ASR/TTS（无 key 时）
+numpy
+pytest
+pytest-asyncio

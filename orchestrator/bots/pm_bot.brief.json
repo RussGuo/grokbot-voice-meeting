@@ -1,0 +1,24 @@
+{
+  "_note": "示例数据（虚构）",
+  "participant_id": "pm_bot",
+  "agenda_item_ids": ["ag-1", "ag-2"],
+  "keywords": ["离线", "同步", "用户", "留存", "摘要", "需求"],
+  "positions": [
+    {"agenda_item_id": "ag-1", "stance": "离线同步应进 v2.0，这是用户反馈里呼声最高的需求。", "evidence": ["feedback.离线"]},
+    {"agenda_item_id": "ag-2", "stance": "AI 摘要先对 5% 用户灰度，看留存再扩。", "evidence": ["growth.留存"]}
+  ],
+  "questions_for_others": [{"to": "eng_bot", "q": "离线同步的冲突合并要多久能做完？"}],
+  "memory_snapshot": {
+    "topic": "「轻记」v2.0 路线",
+    "facts": [
+      {"key": "feedback.离线", "value": "示例数据：反馈里约四成提到离线不可用（虚构）", "source": "示例反馈汇总", "as_of": "2026-10-20"},
+      {"key": "growth.留存", "value": "示例数据：内测组次周留存比对照组高 2 个百分点（虚构）", "source": "示例内测报表", "as_of": "2026-10-22"}
+    ],
+    "open_todos": [{"title": "整理 v2.0 需求文档", "due": "2026-11-03"}],
+    "recent_decisions": ["v2.0 不做多端协同编辑（示例）"],
+    "red_lines": ["不对外承诺发布日期"],
+    "exported_at": "2026-10-27T21:00:00+08:00",
+    "token_estimate": 420
+  },
+  "mandate": {"can_commit": ["整理需求文档", "约用户访谈"], "must_ask": ["预算", "发布日期"]}
+}

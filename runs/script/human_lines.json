@@ -1,0 +1,51 @@
+{
+  "_note": "模拟用户的 4 句台词（文本），t_ms 为相对会议开始（MeetingStarted）的发送时间；由语音队友的模拟人类发布器按时间合成并推流。场景：orchestrator/bots/sim_v1。",
+  "scenario": "sim_v1",
+  "human_identity": "host",
+  "meeting_max_ms": 300000,
+  "lines": [
+    {
+      "id": "L1",
+      "t_ms": 40000,
+      "kind": "barge_in_directive",
+      "barge_in": true,
+      "dur_ms": 1800,
+      "expect": {
+        "bargein": "confirmed",
+        "directive_target": "eng_bot"
+      },
+      "text": "停一下，先让工程说说成本。",
+      "trigger_hint": "增长分身开场发言开始后约 3 秒（必须落在 bot 发言中途）",
+      "barge_speaker": "growth_bot",
+      "barge_delay_ms": 3000
+    },
+    {
+      "id": "L2",
+      "t_ms": 90000,
+      "kind": "question",
+      "text": "产品分身，能不能先整理需求文档？顺便说说多音轨和对账哪个更痛。",
+      "trigger_hint": "工程分身讲完成本、floor 空闲时",
+      "expect": {
+        "commitment_owner": "pm_bot"
+      }
+    },
+    {
+      "id": "L3",
+      "t_ms": 124000,
+      "kind": "ask_principal",
+      "expect": {
+        "principal_asked_by": "growth_bot"
+      },
+      "text": "增长分身，推广预算能给多少？",
+      "trigger_hint": "进入第二项、增长分身发言结束后"
+    },
+    {
+      "id": "L4",
+      "t_ms": 175000,
+      "kind": "close",
+      "text": "好，就按这个来，结束吧。",
+      "trigger_hint": "增长分身插回本体答案之后；若主持人先问「是否结束」，可提前到其后"
+    }
+  ],
+  "_timing": "t_ms 按 fake 语音层的时间线校准（sim.py --scenario sim_v1 --lines ...）；真实 TTS 语速不同，发布器可按 trigger_hint 以事件触发替代固定时间。"
+}

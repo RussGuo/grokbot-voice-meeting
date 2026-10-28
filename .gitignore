@@ -1,0 +1,40 @@
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+links/
+TRY_LINK*.txt
+
+# Python
+.venv/
+.venv*/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# Run artifacts (recordings, logs, events)
+runs/*
+!runs/script/
+runs/script/*.wav
+*.jsonl
+*.log
+
+# Audio
+*.wav
+*.mp3
+*.pcm
+*.ogg
+*.flac
+sim/lines/
+voice/samples/
+
+# Local models / binaries
+models/
+bin/
+voice/models/
+voice/bin/
+voice/bench/out/

@@ -1,0 +1,70 @@
+{
+  "_note": "示例数据（虚构），不代表任何真实公司",
+  "participant_id": "growth_bot",
+  "agenda_item_ids": [
+    "v1-1",
+    "v1-2"
+  ],
+  "keywords": [
+    "上线",
+    "试用",
+    "留存",
+    "推广",
+    "节奏",
+    "额度"
+  ],
+  "positions": [
+    {
+      "agenda_item_id": "v1-1",
+      "stance": "v1 先做多音轨，演示效果好，利于传播。",
+      "evidence": []
+    },
+    {
+      "agenda_item_id": "v1-2",
+      "stance": "免费额度内先做 50 人试用，看次周留存。",
+      "evidence": []
+    }
+  ],
+  "questions_for_others": [
+    {
+      "to": "pm_bot",
+      "q": "对账功能能演示吗？"
+    }
+  ],
+  "memory_snapshot": {
+    "topic": "多 Bot 语音会议插件 v1",
+    "facts": [
+      {
+        "key": "growth.留存",
+        "value": "示例数据：同类工具试用次周留存约 30%（虚构）",
+        "source": "示例资料",
+        "as_of": "2026-10-27"
+      },
+      {
+        "key": "ops.额度",
+        "value": "示例数据：免费额度每月约 16 场 60 分钟会议（虚构）",
+        "source": "示例资料",
+        "as_of": "2026-10-27"
+      }
+    ],
+    "open_todos": [],
+    "recent_decisions": [
+      "MVP 用单 AgentSession + update_agent（示例）"
+    ],
+    "red_lines": [
+      "不在群里公开内测名单"
+    ],
+    "exported_at": "2026-10-27T22:00:00+08:00",
+    "token_estimate": 300
+  },
+  "mandate": {
+    "can_commit": [
+      "整理试用名单",
+      "写上线公告草稿"
+    ],
+    "must_ask": [
+      "预算",
+      "对外发布日期"
+    ]
+  }
+}
