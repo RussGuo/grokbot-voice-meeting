@@ -1,105 +1,87 @@
 """真实语音栈适配：在语音队友的 LiveKitVoiceLayer（voice/voice_layer/livekit_layer.py）之上加编排器需要的「说什么」。
 
 不改 voice/ 的文件，只继承并覆盖 speak()：
-  - 结构化意图（ask_principal / commitments / provenance / confidence）由规则策略（FakeLLM，按 brief + mandate）决定，
-    保证慢路径、承诺、主持流程可预期；
-  - 成员 bot 的口语台词交给 DeepSeek 流式生成（thinking 关闭），按句切段（chunker）送 TTS，令牌失效即停；
-  - 主持人固定话术、转述本体答案、「我问一下本体」不调 LLM（省调用、保证关键信息不走样）；
-  - DeepSeek 不可用或报错时回退到策略台词。
-事件顺序：bot.utterance 必须先于 tts.done（编排器在 tts.done 释放令牌后会丢弃迟到的 utterance）。
+  - 「说什么 + 什么意图」交给 Planner（orchestrator/planner.py）：真实 LLM 流式输出「JSON 头 + 口语正文」，
+    头里的 act / commit / confidence / provenance / addressees 经确定性护栏校验后成为 bot.utterance 的字段，
+    头不会被念出来；mustAsk 预检、relay 转述、主持人固定话术不经 LLM；任何失败回退 FakeLLM 规划；
+  - planner 参数既可以是 Planner（有 async plan），也可以是旧的同步可调用对象（如 FakeLLM，会被包成静态规划）；
+  - 正文按句切段（chunker）送 TTS，令牌失效即停并关掉上游 LLM 流；
+  - 事件顺序：bot.utterance 必须先于 tts.done（编排器在 tts.done 释放令牌后会丢弃迟到的 utterance）。
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import time
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 from voice_layer.events import make_event  # type: ignore
 from voice_layer.livekit_layer import LiveKitVoiceLayer  # type: ignore
 
 from .chunker import pump_segments
-from .i18n import style as i18n_style
+from .planner import FIELD_KEYS, PlanStream, Planner, as_planner, safe_ask_line, static_stream
 
 log = logging.getLogger("live_voice")
 
 
 class MeetingVoiceLayer(LiveKitVoiceLayer):
-    def __init__(self, *a, planner: Callable[[str, Any], dict], chat=None, moderator_id: str = "",
+    def __init__(self, *a, planner: Any, chat=None, moderator_id: str = "",
                  max_tokens: int = 120, language: str = "zh", **kw):
         super().__init__(*a, llm_factory=lambda _pid: None, **kw)
         self.planner = planner
-        self.chat = chat
+        self._planner: Planner = as_planner(planner)
+        self.chat = chat                     # 保留给调用方；LLM 调用由 planner 持有的 chat 完成
         self.moderator_id = moderator_id
         self.max_tokens = max_tokens
         self.language = language or "zh"
         self.token_valid: Callable[[str], bool] = lambda _t: True
-        self.llm_stats: list[dict] = []      # 每次 LLM 调用：ttft_ms / first_seg_ms / total_ms / ok
+        # 每轮一条：pid / llm / header_ms / first_seg_ms / total_ms / ok / fallback / guard ...
+        self.llm_stats: list[dict] = []
+        self._bg: set[asyncio.Task] = set()  # 持有后台 task 的引用，避免被 GC 提前回收
 
-    def _use_llm(self, pid: str, plan: dict) -> bool:
-        if self.chat is None or pid == self.moderator_id:
-            return False
-        if plan.get("ask_principal") or plan.get("provenance") == "principal":
-            return False
-        return True
+    def _spawn(self, coro) -> asyncio.Task:
+        t = asyncio.create_task(coro)
+        self._bg.add(t)
+        t.add_done_callback(self._bg.discard)
+        return t
 
-    def _messages(self, ctx, plan: dict) -> list[dict]:
-        msgs = ctx.to_messages()
-        must = plan["text"]
-        extra = f"{i18n_style(self.language)}\n这一轮你要表达的要点（可以换说法，但数字和结论不能改）：{must}"
-        if self.language == "en":
-            extra = f"{i18n_style(self.language)}\nSay this, in your own words, without changing numbers or conclusions: {must}"
-        if plan.get("commitments"):
-            if self.language == "en":
-                extra += f"\nSay explicitly that you commit to: {plan['commitments'][0]}."
-            else:
-                extra += f"\n必须明确说你当场答应：{plan['commitments'][0]}。"
-        msgs.append({"role": "user", "content": extra})
-        return msgs
+    async def _plan(self, participant_id: str, ctx: Any) -> PlanStream:
+        try:
+            return await self._planner.plan(participant_id, ctx)
+        except Exception as e:  # noqa: BLE001  规划器本身不该抛；抛了就说安全话术并转问本体，别让话轮卡死
+            log.exception("planner 异常")
+            meta = getattr(ctx, "turn_meta", {}) or {}
+            q = meta.get("directive_text") or meta.get("last_text") or ""
+            plan = {"text": safe_ask_line(self.language), "provenance": "model", "confidence": 0.3,
+                    "commitments": [], "addressees": []}
+            if q and participant_id != self.moderator_id:
+                plan["ask_principal"] = q
+            return static_stream(plan, {"path": "planner_error", "fallback": f"planner:{type(e).__name__}"})
 
     async def speak(self, token_id: str, participant_id: str, ctx: Any) -> None:
         if self.current is None or self.current.bot_id != participant_id:
             await self.switch_agent(participant_id, ctx)
-        plan = self.planner(participant_id, ctx)
-        use_llm = self._use_llm(participant_id, plan)
+        t0 = time.perf_counter()
+        ps = await self._plan(participant_id, ctx)
         self._token, self._speaking_pid, self._played_s = token_id, participant_id, 0.0
         q: asyncio.Queue = asyncio.Queue()
         spoken: list[str] = []
-        stat = {"pid": participant_id, "token_id": token_id, "llm": use_llm, "t0": time.perf_counter()}
+        stat: dict[str, Any] = {"pid": participant_id, "token_id": token_id}
 
         def send(seg) -> None:
             if not spoken:
-                stat["first_seg_ms"] = (time.perf_counter() - stat["t0"]) * 1000
+                stat["first_seg_ms"] = (time.perf_counter() - t0) * 1000
             spoken.append(seg.text)
             q.put_nowait(seg.text)
             self.bus.emit(make_event("tts.segment", participant_id, token_id=token_id, seq=seg.seq, text=seg.text))
 
-        async def source():
-            if not use_llm:
-                yield plan["text"]
-                return
-            got = False
-            try:
-                async for piece in self.chat.astream_text(self._messages(ctx, plan), max_tokens=self.max_tokens,
-                                                          thinking="disabled"):
-                    if not got:
-                        stat["ttft_ms"] = (time.perf_counter() - stat["t0"]) * 1000
-                        got = True
-                    yield piece
-                stat["ok"] = got
-            except Exception as e:  # noqa: BLE001
-                stat["ok"] = False
-                stat["error"] = type(e).__name__
-                log.warning("DeepSeek 调用失败（%s），回退策略台词", type(e).__name__)
-            if not got:
-                yield plan["text"]
-
         async def producer():
             try:
-                await pump_segments(source(), token_id, self.token_valid, send)
+                await pump_segments(ps, token_id, self.token_valid, send)
             except Exception:  # noqa: BLE001
                 log.exception("producer")
             finally:
+                await ps.aclose()                  # 令牌失效 / 出错时关掉上游 LLM 流
                 q.put_nowait(None)
 
         async def tts_text():
@@ -109,15 +91,23 @@ class MeetingVoiceLayer(LiveKitVoiceLayer):
                     return
                 yield t
 
-        asyncio.create_task(producer())
+        task = self._spawn(producer())
         handle = self.session.say(tts_text(), add_to_chat_ctx=False)
 
         def _done(h) -> None:
-            stat["total_ms"] = (time.perf_counter() - stat["t0"]) * 1000
-            self.llm_stats.append({k: v for k, v in stat.items() if k != "t0"})
-            text = "".join(spoken) or plan["text"]
-            fields = {k: plan[k] for k in ("provenance", "confidence", "commitments", "addressees", "ask_principal")
-                      if k in plan}
+            if not task.done():                    # 被打断：语音先结束，别让上游继续烧 token
+                task.cancel()
+            stat["total_ms"] = (time.perf_counter() - t0) * 1000
+            st = ps.stats
+            stat.update(llm=bool(st.get("llm")), path=st.get("path"), ok=not st.get("fallback"))
+            for k in ("header_ms", "fallback", "guard", "act", "truncated"):
+                if k in st:
+                    stat[k] = st[k]
+            if "header_ms" in st:
+                stat["ttft_ms"] = st["header_ms"]  # 兼容旧字段名
+            self.llm_stats.append(stat)
+            text = "".join(spoken) or ps.planned_text
+            fields = {k: ps.fields[k] for k in FIELD_KEYS if k in ps.fields}
             self.bus.emit(make_event("bot.utterance", participant_id, token_id=token_id, text=text,
                                      interrupted=bool(h.interrupted), **fields))
             self.bus.emit(make_event("tts.done", participant_id, token_id=token_id, interrupted=bool(h.interrupted)))
