@@ -16,7 +16,7 @@ from orchestrator.sim import run_lines
 ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location("acceptance", ROOT / "scripts" / "acceptance.py")
 acc = importlib.util.module_from_spec(spec)
-import sys; sys.modules["acceptance"] = acc
+import sys; sys.modules["acceptance"] = acc  # noqa: E402  须在 importlib 装载之间注册
 spec.loader.exec_module(acc)
 
 SR = 8000

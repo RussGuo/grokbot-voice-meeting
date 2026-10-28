@@ -7,12 +7,15 @@
 可选：
   LIVEKIT_AGENT_NAME  若 agent 用显式 dispatch（agent_name），在 token 里带上，进房即派发
   WEB_HOST / WEB_PORT 默认 127.0.0.1 / 8787
+  MEETING_ACCESS_KEY  设了即「公网模式」：口令走 `Authorization: Bearer <key>` 头或 cookie；
+                      旧的 `?k=<key>` 仍可用但不推荐（会留在地址栏和上游日志里）。口令不写进本进程的日志。
 """
 import os
 import re
 from pathlib import Path
 
 from aiohttp import web
+from aiohttp.web_log import AccessLogger
 from livekit import api
 
 HERE = Path(__file__).parent
@@ -142,17 +145,34 @@ async def health(_: web.Request) -> web.Response:
 ACCESS_KEY = os.environ.get("MEETING_ACCESS_KEY", "")  # 设了即「公网模式」
 
 
+def _candidate_keys(request: web.Request) -> list[tuple[str, str]]:
+    """口令的出示方式，按推荐程度排序：Authorization: Bearer 头 > cookie `mk` > ?k=（旧链接，不推荐：
+    查询串会留在地址栏、浏览器历史和上游代理日志里）。"""
+    out = []
+    auth = request.headers.get("Authorization", "")
+    if auth[:7].lower() == "bearer " and auth[7:].strip():
+        out.append((auth[7:].strip(), "header"))
+    if request.cookies.get("mk"):
+        out.append((request.cookies["mk"], "cookie"))
+    if request.query.get("k"):
+        out.append((request.query["k"], "query"))
+    return out
+
+
 @web.middleware
 async def access_guard(request: web.Request, handler):
-    """公网模式（经隧道对外）：除 /healthz 外都要口令；口令可走 ?k= 或首访后下发的 HttpOnly cookie。
-    公网模式下关闭 /api/replay，token 只签给 MEETING_HUMAN_IDENTITY，房间可锁定为 MEETING_ROOM。"""
+    """公网模式（经隧道对外）：除 /healthz 外都要口令；口令走 `Authorization: Bearer <key>` 头，
+    或首访后下发的 HttpOnly cookie；旧的 `?k=<key>` 仍可用（不推荐），用过一次就换成 cookie。
+    公网模式下关闭 /api/replay，token 只签给 MEETING_HUMAN_IDENTITY，房间可锁定为 MEETING_ROOM。
+    口令不进日志：访问日志只记路径（见 PathOnlyAccessLogger），错误文本不回显口令。"""
     import hmac
     if not ACCESS_KEY or request.path == "/healthz":
         return await handler(request)
     if request.path.startswith("/api/replay"):
         raise web.HTTPNotFound()
-    got = request.query.get("k") or request.cookies.get("mk", "")
-    if not hmac.compare_digest(got.encode(), ACCESS_KEY.encode()):
+    via = next((how for got, how in _candidate_keys(request)
+                if hmac.compare_digest(got.encode(), ACCESS_KEY.encode())), None)
+    if via is None:
         raise web.HTTPForbidden(text="forbidden")
     if request.path == "/api/token":
         human = os.environ.get("MEETING_HUMAN_IDENTITY", "host")
@@ -162,7 +182,7 @@ async def access_guard(request: web.Request, handler):
         if locked and request.query.get("room") != locked:
             raise web.HTTPForbidden(text="room locked")
     resp = await handler(request)
-    if request.query.get("k"):
+    if via == "query" and request.method in ("GET", "HEAD"):
         resp.set_cookie("mk", ACCESS_KEY, httponly=True, secure=True, samesite="Strict", max_age=6 * 3600)
     return resp
 
@@ -178,6 +198,17 @@ def make_app() -> web.Application:
     return app
 
 
+class PathOnlyAccessLogger(AccessLogger):
+    """默认访问日志记 `request.path_qs`，`?k=<口令>` 会原样落进日志文件；这里只记路径。"""
+
+    def log(self, request, response, time):
+        try:
+            self.logger.info('%s "%s %s" %s %s %.3fs', request.remote or "-", request.method, request.path,
+                             response.status, response.body_length, time)
+        except Exception:
+            self.logger.exception("Error in logging")
+
+
 if __name__ == "__main__":
     web.run_app(make_app(), host=os.environ.get("WEB_HOST", "127.0.0.1"),
-                port=int(os.environ.get("WEB_PORT", "8787")))
+                port=int(os.environ.get("WEB_PORT", "8787")), access_log_class=PathOnlyAccessLogger)

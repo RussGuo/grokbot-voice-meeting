@@ -28,7 +28,7 @@ sleep 3
 (cd sim && $SIMPY sim_human.py --room "$ROOM" --lines "$ROOT/runs/script/human_lines.json" --out "$RUN" --seconds "$MAX_S" --no-dispatch >"$RUN/sim_human.log" 2>&1) &
 HPID=$!
 sleep 3
-$SIMPY scripts/dispatch.py --room "$ROOM" >"$RUN/dispatch.log" 2>&1 || { echo "派发失败"; cat "$RUN/dispatch.log"; }
+$SIMPY scripts/dispatch.py --room "$ROOM" --no-scene >"$RUN/dispatch.log" 2>&1 || { echo "派发失败"; cat "$RUN/dispatch.log"; }
 
 T0=$(date +%s)
 while [ ! -f "$RUN/done.json" ] && [ $(( $(date +%s) - T0 )) -lt "$MAX_S" ]; do sleep 2; done

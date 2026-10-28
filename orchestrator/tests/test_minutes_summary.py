@@ -2,7 +2,6 @@
 import asyncio
 import re
 
-import pytest
 
 from orchestrator.driver import SimDriver
 from orchestrator.events import project

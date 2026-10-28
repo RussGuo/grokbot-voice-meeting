@@ -282,6 +282,30 @@ class Brief(Serializable):
     keywords: list[str] = field(default_factory=list)  # 相关度规则打分用的领域词
 
 
+# prompt 段落标题，随会议语言切换。只放 ChatCtxRecipe.to_messages 用到的几项；
+# 规则与回合指令的文案在 orchestrator/i18n.py。未知语言按 zh。
+_CTX_LABELS: dict[str, dict[str, str]] = {
+    "zh": {
+        "brief": "【你的会前 brief】",
+        "snapshots": "【其他参会方共享快照（关键数字）】",
+        "snapshots_full": "【参会各方主题记忆快照（共享可见）】",
+        "minutes": "【最近会议纪要】",
+        "task": "【本轮任务】",
+    },
+    "en": {
+        "brief": "[Your pre-meeting brief]",
+        "snapshots": "[Snapshots shared by the other participants (key figures)]",
+        "snapshots_full": "[Topic memory snapshots of all participants (visible to everyone)]",
+        "minutes": "[Recent meeting minutes]",
+        "task": "[Your task this turn] ",
+    },
+}
+
+
+def ctx_labels(language: str) -> dict[str, str]:
+    return _CTX_LABELS.get((language or "zh").strip().lower()[:2], _CTX_LABELS["zh"])
+
+
 @dataclass
 class ChatCtxRecipe(Serializable):
     """编排器组装给 Agent 的上下文（update_agent 切换后新 Agent 默认不带历史）。"""
@@ -296,6 +320,7 @@ class ChatCtxRecipe(Serializable):
 
     brief_text: str = ""              # 压缩后的 brief（≤800 字，见 brief_compact.py）
     snapshots_text: dict[ID, str] = field(default_factory=dict)  # 其他参会方快照的关键数字
+    language: str = "zh"              # 会议语言（Meeting.language）；决定 to_messages 的段落标题
 
     def to_messages(self, compact: bool = True) -> list[dict[str, str]]:
         """转成通用 role/content 列表；main.py 再转成 livekit ChatContext。
@@ -303,22 +328,24 @@ class ChatCtxRecipe(Serializable):
         compact=True（默认）用压缩文本；False 为全量 JSON（只用于对比测试）。
         """
         import json
+        lb = ctx_labels(self.language)
+        colon = ":" if lb is _CTX_LABELS["en"] else "："
         msgs = [{"role": "system", "content": self.system}]
         if compact:
             if self.brief_text:
-                msgs.append({"role": "system", "content": "【你的会前 brief】\n" + self.brief_text})
+                msgs.append({"role": "system", "content": lb["brief"] + "\n" + self.brief_text})
             if self.snapshots_text:
-                msgs.append({"role": "system", "content": "【其他参会方共享快照（关键数字）】\n" + "\n".join(
-                    f"{pid}：\n{t}" for pid, t in self.snapshots_text.items() if t)})
+                msgs.append({"role": "system", "content": lb["snapshots"] + "\n" + "\n".join(
+                    f"{pid}{colon}\n{t}" for pid, t in self.snapshots_text.items() if t)})
         else:
             if self.brief is not None:
-                msgs.append({"role": "system", "content": "【你的会前 brief】\n" + json.dumps(self.brief, ensure_ascii=False)})
+                msgs.append({"role": "system", "content": lb["brief"] + "\n" + json.dumps(self.brief, ensure_ascii=False)})
             if self.topic_snapshots:
-                msgs.append({"role": "system", "content": "【参会各方主题记忆快照（共享可见）】\n" + json.dumps(self.topic_snapshots, ensure_ascii=False)})
+                msgs.append({"role": "system", "content": lb["snapshots_full"] + "\n" + json.dumps(self.topic_snapshots, ensure_ascii=False)})
         if self.shared_minutes:
-            msgs.append({"role": "user", "content": "【最近会议纪要】\n" + "\n".join(self.shared_minutes[-self.max_turns:])})
+            msgs.append({"role": "user", "content": lb["minutes"] + "\n" + "\n".join(self.shared_minutes[-self.max_turns:])})
         if self.turn_instruction:
-            msgs.append({"role": "user", "content": "【本轮任务】" + self.turn_instruction})
+            msgs.append({"role": "user", "content": lb["task"] + self.turn_instruction})
         return msgs
 
 

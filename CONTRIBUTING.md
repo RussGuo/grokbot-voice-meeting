@@ -3,7 +3,7 @@
 Issues and pull requests are welcome. Please:
 
 - Run `pytest` and `pytest voice/tests` before opening a PR. Both must pass with no API keys and no network.
-- Run `ruff check meet providers orchestrator/scene.py orchestrator/i18n.py orchestrator/commitments.py` if you touch those areas.
+- Run `ruff check .` (CI does). The config ignores the one-line style rules E701/E702/E731/E741 on purpose; see `pyproject.toml`.
 - Do not commit `.env`, tokens, join links, or real briefs. `bots.yaml` is gitignored on purpose.
 - Keep vendor SDKs behind `providers/`. A new ASR, TTS, LLM, or transport is a registry entry plus a test that does not call the network. See [docs/PROVIDERS.md](docs/PROVIDERS.md).
 - Speaker ids belong in `config/voices.json`.

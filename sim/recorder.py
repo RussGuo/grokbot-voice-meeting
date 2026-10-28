@@ -2,7 +2,13 @@
 用法: python sim/recorder.py --room ROOM [--out DIR] [--seconds N]
 不使用 LiveKit Egress（避免付费）。每条音轨按到达的墙钟时间对齐（缺口补静音）。
 另写 levels.jsonl：每 20ms 每条音轨的 RMS dBFS，用于计算插话延迟。"""
-import argparse, asyncio, json, math, os, signal, wave, time
+import argparse
+import asyncio
+import json
+import math
+import signal
+import wave
+import time
 from pathlib import Path
 import numpy as np
 from livekit import rtc
