@@ -38,6 +38,13 @@ EXTRA_TYPES = {
     "ContextTruncated",    # chat_ctx 里的 brief / 快照超长被截断
     "DecisionSummarized",  # 议程项结论的后台总结落地（覆盖同一项 DecisionRecorded 里的兜底文本）
     "HumanDirective",      # 用户的口头指令（如「先让工程说说成本」）：stage=parsed / executed
+    # —— 网页控制（meeting.control）：会中改议程 / 加 bot ——
+    "AgendaItemAdded",     # 用户在末尾加了议程项：agenda_item={id,title,timebox_ms,owner_id}, index
+    "AgendaItemRenamed",   # 当前议程项改名：agenda_item_id, title, old_title
+    "AddableBots",         # 可加入的 bot（注册表里还没入会的）：bots=[{id,display_name}]，只有 id 与名字，不含 context
+    "BotAdding",           # 开始后台准备某个 bot（摘要 brief / 连接 / 预热），网页显示「正在加入」
+    "BotJoined",           # bot 已入会：participant={id,kind,display_name,role,tts_voice}
+    "ControlRejected",     # 控制被拒或加入失败：action, reason（短代码，网页翻成中文）, 可选 bot_id
 }
 
 

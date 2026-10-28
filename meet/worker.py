@@ -37,6 +37,7 @@ if (_checkout / "main.py").is_file():    # 源码仓库里跑；安装包里 par
 
 from livekit.agents import AgentServer, JobContext  # noqa: E402
 
+from meet.live_controls import addable_bots, load_worker_registry, parse_control, run_bot_add  # noqa: E402
 from meet.runtime import join_wait_s, make_run_id, runs_root  # noqa: E402
 from orchestrator.bots import load_example  # noqa: E402
 from orchestrator.config import llm_config, report  # noqa: E402
@@ -173,12 +174,17 @@ async def entrypoint(ctx: JobContext):
     # 事件 at = 相对会议开始的 ms；clock.json 给录音对齐（start_ms = wav 首帧墙钟 - t0_epoch_ms）
     t0, t0_epoch = monotonic_ms(), time.time() * 1000
     (run_dir / "clock.json").write_text(json.dumps({"t0_epoch_ms": t0_epoch, "room": ctx.room.name}), "utf-8")
+    # 会中加 bot：注册表在 worker 所在机器上（bots.yaml），只把 id + 显示名告诉网页；没有注册表就不提供这个功能
+    registry, why = load_worker_registry()
+    if why:
+        log.info("没有可用的 bots 注册表（%s）：本场不能会中加 bot", why)
     # 真实会议（meet 的场景）默认不回答本体问题，留给纪要；样例场景（sim）保留 mock。MEETING_PRINCIPAL 显式设置永远优先。
     orch = Orchestrator(meeting, briefs, voice,
                         principal_factory=partial(principal_from_env, default="defer" if scenario == "scene" else "mock"),
                         clock=lambda: monotonic_ms() - t0,
                         summarizer=build_summarizer(chat, lang),   # 议程结论后台总结；chat 为 None 时只用兜底
-                        scorer_chat=chat)                          # MEETING_SCORER=llm 时才启用二次打分
+                        scorer_chat=chat,                          # MEETING_SCORER=llm 时才启用二次打分
+                        addable_bots=addable_bots(registry, (p.id for p in meeting.participants)))
     voice.token_valid = orch.token_valid
 
     # —— 给网页：领域事件原样转发到 meeting.events；网页按钮经 meeting.control 进来（只认用户）——
@@ -189,6 +195,28 @@ async def entrypoint(ctx: JobContext):
         t.add_done_callback(pending_pub.discard)
     unsub_ev = orch.log.subscribe(lambda e: _pub("meeting.events", e.to_json()))
 
+    # 会中加 bot 的后台任务（摘要 brief 在线程里、连接 LiveKit、预热 TTS）；持有引用，结束时取消
+    bot_tasks: set = set()
+    voices_in_use: dict[str, str] = dict(voices)                 # id → 火山音色；加 bot 时据此挑没人用的
+    for p in meeting.participants:
+        if p.kind == "bot" and not voices_in_use.get(p.id) and p.id in cfg.bots:
+            voices_in_use[p.id] = cfg.bots[p.id].volc_speaker
+
+    from voice_layer.config import apply_voices as _apply  # type: ignore
+
+    def _spawn_bot(bot_id: str) -> None:
+        async def connect(bid: str, name: str) -> None:
+            if speakers is not None:
+                await speakers.connect([(bid, name)])
+        t = asyncio.create_task(run_bot_add(
+            bot_id, meeting=meeting, registry=registry, voices=voices_in_use, chat=chat,
+            model=lc.model if chat is not None else "heuristic", inbox=orch.inbox,
+            apply_voice=lambda bid, spk: _apply(cfg, {bid: spk}), connect=connect,
+            warm=lambda bid: voice.agent_for(bid)))
+        bot_tasks.add(t)
+        t.add_done_callback(bot_tasks.discard)
+    orch.bot_spawner = _spawn_bot
+
     def _on_data(packet) -> None:
         if getattr(packet, "topic", "") != "meeting.control":
             return
@@ -196,13 +224,11 @@ async def entrypoint(ctx: JobContext):
         if sender != human:
             log.warning("忽略非用户的控制消息（来自 %s）", sender or "?")
             return
-        try:
-            action = json.loads(bytes(packet.data).decode("utf-8")).get("action")
-        except Exception:  # noqa: BLE001
+        ev = parse_control(bytes(packet.data))        # 字段校验在 live_controls；非法字段变成 control.rejected
+        if ev is None or getattr(orch, "inbox", None) is None:
             return
-        if action in ("end", "interrupt") and getattr(orch, "inbox", None) is not None:
-            log.info("网页控制：%s", action)
-            orch.inbox.put_nowait({"type": f"control.{action}"})
+        log.info("网页控制：%s", ev["type"])
+        orch.inbox.put_nowait(ev)
     ctx.room.on("data_received", _on_data)
     stop = asyncio.Event()
     async def _on_shutdown(reason: str) -> None:   # livekit 按 co_argcount 传入关闭原因
@@ -221,6 +247,8 @@ async def entrypoint(ctx: JobContext):
         await orch.run(stop)      # 内部先 orch.start()（发 roster、主持人开场），再进入事件循环
     finally:
         watcher.cancel()
+        for t in list(bot_tasks):
+            t.cancel()
         unsub_ev()
         from orchestrator.minutes import export, render_md
         b = export(orch.log, run_dir)

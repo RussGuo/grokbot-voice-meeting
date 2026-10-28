@@ -14,7 +14,9 @@ import asyncio
 import heapq
 import itertools
 import logging
+import re
 import time
+import unicodedata
 from typing import Any, Callable, Optional
 
 from .brief_compact import compact_brief, compact_snapshot
@@ -28,24 +30,42 @@ from .i18n import rules as i18n_rules
 from .i18n import speaker_line as i18n_speaker_line
 from .i18n import turn as i18n_turn
 from .models import (
-    ID, Brief, ChatCtxRecipe, Commitment, FloorToken, Meeting, Millis,
+    ID, AgendaItem, Brief, ChatCtxRecipe, Commitment, FloorToken, Meeting, Millis,
     PrincipalAnswer, PrincipalQuery, Utterance,
 )
 from .principal import PrincipalClient, deliver_to
 from .scheduler import Candidate, Cue, Scheduler, cooldown_penalty
 from .scoring import BotCtx, ScoreRequest, build_scorer
-from .state_machine import Floor, MeetingStateMachine, Phase
+from .state_machine import FLOOR_EXIT_OK, Floor, IllegalTransition, MeetingStateMachine, Phase
 from .summarize import SummaryRequest, fallback_text
 from .voice_iface import VoiceLayer
 
 F = Floor
 log = logging.getLogger("orchestrator")
 
+# 网页控制的上限（用户文本一律在这里再校验一遍，不信任上游）
+MAX_TITLE_CHARS = 80            # 议程标题
+MAX_AGENDA_ITEMS = 30
+MAX_BOTS = 8                    # 会中最多几个成员 bot（含正在加入的）；音色池也是有限的
+MAX_ADDING = 2                  # 同时在后台加入的 bot 数
+NEW_ITEM_TIMEBOX_MS = 180_000   # 会中新增议程项的时间盒（与 scene.build_scene 一致）
+BOT_ID_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+
+
+def clean_title(raw: Any) -> Optional[str]:
+    """用户输入的议程标题：必须是 str；控制字符 / 换行换成空格并折叠空白；1..MAX_TITLE_CHARS 字，否则 None。"""
+    if not isinstance(raw, str):
+        return None
+    text = "".join(" " if unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp") else ch for ch in raw)
+    text = " ".join(text.split())
+    return text if 0 < len(text) <= MAX_TITLE_CHARS else None
+
 
 class Orchestrator:
     def __init__(self, meeting: Meeting, briefs: dict[ID, Brief], voice: VoiceLayer,
                  principal_factory: Callable[["Orchestrator"], PrincipalClient],
-                 clock: Callable[[], Millis], log_path=None, summarizer=None, scorer_chat: Any = None):
+                 clock: Callable[[], Millis], log_path=None, summarizer=None, scorer_chat: Any = None,
+                 addable_bots: Optional[dict[ID, str]] = None):
         self.m = meeting
         self.briefs = briefs
         self.voice = voice
@@ -103,6 +123,11 @@ class Orchestrator:
         self._transcript_after_eot = False
         self.summarizer = summarizer                    # async (SummaryRequest) -> str|None；None → 只用兜底结论
         self._summary_tasks: dict[ID, asyncio.Task] = {}   # 议程项 id → 后台总结任务
+        # 会中加 bot：addable = 注册表里还没入会的 bot（id → 显示名，不含 context）；
+        # bot_spawner 由 worker 注入（同步函数，只负责起后台任务），没有它就不接受 control.bot_add。
+        self.addable: dict[ID, str] = dict(addable_bots or {})
+        self.bot_spawner: Optional[Callable[[ID], None]] = None
+        self._adding: set[ID] = set()                      # 正在后台准备的 bot
 
     # ———————————————————— 基础设施 ————————————————————
     def now(self) -> Millis:
@@ -161,6 +186,7 @@ class Orchestrator:
             "participants": [{"id": p.id, "kind": p.kind, "display_name": p.display_name, "role": p.role,
                               "tts_voice": p.agent_profile.tts_voice if p.agent_profile else None}
                              for p in self.m.participants]})
+        self._emit_addable()
         for p in self.m.participants:
             self.emit("InviteSent", payload={"participant_id": p.id})
             self.emit("InviteAnswered", payload={"participant_id": p.id, "answer": p.invite})
@@ -175,9 +201,18 @@ class Orchestrator:
         self._start_agenda_item(first=True)
         await self.schedule()
 
-    async def add_participant(self, p) -> None:
+    async def add_participant(self, p, brief: Optional[Brief] = None) -> None:
+        """会中加人。bot 带 brief 时同时登记到 briefs（planner / 打分器共用同一个 dict）和打分器，之后能举手、被点名。"""
         self.m.participants.append(p)
+        if brief is not None and p.kind == "bot":
+            self.briefs[p.id] = brief
+            self.scorer.add_bot(p.id, brief, p.aliases + [p.display_name])
+            self.emit("BriefSubmitted", brief=brief)
         await self.publish_roster()
+
+    def _emit_addable(self) -> None:
+        if self.addable:
+            self.emit("AddableBots", bots=[{"id": k, "display_name": v} for k, v in self.addable.items()])
 
     def _start_agenda_item(self, first: bool = False) -> None:
         item = self.m.current_agenda
@@ -451,6 +486,143 @@ class Orchestrator:
         self.emit("HumanDirective", stage="button", action="interrupt")
         if self.token is not None:
             self.schedule_timer(6_000, {"type": "timer.controlRelease", "token_id": self.token.id})
+
+    # —— 网页控制：议程 / 加 bot（同样只会从 worker 的 inbox 进来，发送方已校验是用户）——
+    def _controls_open(self) -> bool:
+        """只在讨论中接受：散会流程里（用户已确认结束 / 已宣布结束）不再改议程、不再加人。"""
+        return self.sm.phase == Phase.IN_AGENDA and not self._human_ended and not self._end_confirmed
+
+    def _reject(self, action: str, reason: str, **extra: Any) -> None:
+        """控制被拒：发 ControlRejected，网页据 reason 显示原因。会议已在收尾 / 结束时静默丢弃。"""
+        if self.sm.phase in (Phase.CLOSING, Phase.POST_MEETING, Phase.DONE):
+            log.info("会议已收尾，忽略控制 %s（%s）", action, reason)
+            return
+        log.info("拒绝网页控制 %s：%s", action, reason)
+        self.emit("ControlRejected", action=action, reason=reason, **extra)
+
+    async def _on_control_rejected(self, ev):
+        """worker 解析 / 校验阶段就失败的控制（字段非法等），在这里统一落成事件。"""
+        self._reject(str(ev.get("action") or "?")[:32], str(ev.get("reason") or "invalid")[:32])
+
+    def _new_agenda_id(self) -> ID:
+        used = {a.id for a in self.m.agenda}
+        n = len(used) + 1
+        while f"ag-{n}" in used:
+            n += 1
+        return f"ag-{n}"
+
+    async def _on_control_agenda_add(self, ev):
+        if not self._controls_open():
+            return self._reject("agenda_add", "not_in_agenda")
+        title = clean_title(ev.get("title"))
+        if title is None:
+            return self._reject("agenda_add", "invalid")
+        if len(self.m.agenda) >= MAX_AGENDA_ITEMS:
+            return self._reject("agenda_add", "too_many")
+        item = AgendaItem(id=self._new_agenda_id(), title=title, owner_id=self.moderator_id,
+                          timebox_ms=NEW_ITEM_TIMEBOX_MS, goal="discuss")
+        self.m.agenda.append(item)
+        self.emit("AgendaItemAdded", agenda_item={"id": item.id, "title": item.title, "timebox_ms": item.timebox_ms,
+                                                  "owner_id": item.owner_id}, index=len(self.m.agenda) - 1)
+        if self._end_confirm is not None:        # 正在问「是否结束」：又多了一项，取消这次询问，不要散会
+            self._end_confirm = None
+            self._end_gen += 1
+            self.emit("EndConfirm", stage="continue", reason="agenda_added")
+        if self._agenda_due and self.token is None and self.sm.floor == F.FLOOR_IDLE:
+            await self.schedule()                # 本项早已到点、只是因为没有下一项才停着：现在可以推进了
+
+    async def _on_control_agenda_rename(self, ev):
+        if not self._controls_open():
+            return self._reject("agenda_rename", "not_in_agenda")
+        title = clean_title(ev.get("title"))
+        item = self.m.current_agenda
+        if title is None or item is None:
+            return self._reject("agenda_rename", "invalid")
+        if ev.get("item_id") not in (None, item.id):   # 页面点按钮时看到的不是现在这一项（刚好换项了）
+            return self._reject("agenda_rename", "stale_item")
+        if title == item.title:
+            return
+        old, item.title = item.title, title
+        self.emit("AgendaItemRenamed", agenda_item_id=item.id, title=title, old_title=old)
+
+    async def _on_control_agenda_next(self, ev):
+        """跳到下一项：先让出话轮，再走正常的 advance_agenda（记决策 / 总结 / 开下一项）。最后一项不能跳（那是「结束会议」）。"""
+        if not self._controls_open():
+            return self._reject("agenda_next", "not_in_agenda")
+        if self._is_last_item():
+            return self._reject("agenda_next", "last_item")
+        self.emit("HumanDirective", stage="button", action="agenda_next", agenda_item_id=self.agenda_id)
+        await self._clear_floor("agenda_skip")
+        await self.advance_agenda()
+
+    async def _clear_floor(self, reason: str) -> None:
+        """议程被用户切走前清空话轮：bot 立即停（FloorRevoked），用户的话轮释放，冷场 / cue 态回到空闲。"""
+        tok = self.token
+        if tok is not None:
+            if self.is_bot(tok.holder_id):
+                await self._revoke(reason)
+            else:
+                self.emit("FloorReleased", token=tok)
+                self.sched.on_turn_end(tok.holder_id, self.agenda_id, self._human_turn_start or self.now(), self.now())
+                self.token = None
+                await self._publish(tok.holder_id, "idle")
+        self._pending_cue_human = None
+        self._after_recap = None
+        if self.sm.floor not in FLOOR_EXIT_OK:
+            try:
+                self.sm.to_floor(F.FLOOR_IDLE)
+            except IllegalTransition:
+                self.sm.floor = F.FLOOR_IDLE
+
+    async def _on_control_bot_add(self, ev):
+        """用户从下拉里选了一个注册表里的 bot。这里只做快速校验并起后台任务；
+        brief 摘要（阻塞 LLM）/ 音色 / LiveKit 连接 / TTS 预热都在 worker 的后台任务里，做完投 control.bot_ready。"""
+        bid = ev.get("bot_id")
+        if not isinstance(bid, str) or not BOT_ID_RE.fullmatch(bid):
+            return self._reject("bot_add", "invalid")
+        if not self._controls_open():
+            return self._reject("bot_add", "not_in_agenda", bot_id=bid)
+        if self.bot_spawner is None:
+            return self._reject("bot_add", "unsupported", bot_id=bid)
+        if any(p.id == bid for p in self.m.participants):
+            return self._reject("bot_add", "already_in_meeting", bot_id=bid)
+        if bid in self._adding:
+            return self._reject("bot_add", "already_adding", bot_id=bid)
+        if bid not in self.addable:
+            return self._reject("bot_add", "unknown_bot", bot_id=bid)
+        bots = sum(1 for p in self.m.participants if p.kind == "bot" and p.id != self.moderator_id)
+        if bots + len(self._adding) >= MAX_BOTS or len(self._adding) >= MAX_ADDING:
+            return self._reject("bot_add", "busy" if len(self._adding) >= MAX_ADDING else "too_many_bots", bot_id=bid)
+        self._adding.add(bid)
+        self.emit("BotAdding", bot_id=bid, display_name=self.addable[bid])
+        try:
+            self.bot_spawner(bid)
+        except Exception as e:  # noqa: BLE001
+            log.warning("起 bot 加入任务失败：%s", type(e).__name__)
+            self._adding.discard(bid)
+            self._reject("bot_add", "internal", bot_id=bid)
+
+    async def _on_control_bot_failed(self, ev):
+        bid = str(ev.get("bot_id") or "")
+        self._adding.discard(bid)
+        self._reject("bot_add", str(ev.get("reason") or "internal")[:32], bot_id=bid)
+
+    async def _on_control_bot_ready(self, ev):
+        """后台任务建好了 Participant + Brief：这里只做内存里的快速部分（登记、发 roster、主持人播报）。"""
+        p, brief = ev["participant"], ev["brief"]
+        self._adding.discard(p.id)
+        if not self._controls_open():
+            return self._reject("bot_add", "not_in_agenda", bot_id=p.id)
+        if any(x.id == p.id for x in self.m.participants):
+            return self._reject("bot_add", "already_in_meeting", bot_id=p.id)
+        await self.add_participant(p, brief)
+        self.addable.pop(p.id, None)
+        self.emit("BotJoined", participant={
+            "id": p.id, "kind": p.kind, "display_name": p.display_name, "role": p.role,
+            "tts_voice": p.agent_profile.tts_voice if p.agent_profile else None})
+        self._emit_addable()
+        self.sched.cue(Cue(self.moderator_id, "bot_joined", self.now(), note=p.display_name))
+        await self.schedule()
 
     async def _on_timer_controlRelease(self, ev):
         tok = self.token
@@ -830,6 +1002,8 @@ class Orchestrator:
             if intent == "directive":
                 meta["addressed"] = True
                 meta["directive_text"] = c.ref.note
+            if intent == "bot_joined":
+                meta["target_name"] = c.ref.note
             if intent == "recap":
                 q = self.queries[c.ref.ref_query_id]
                 meta["recap_item"] = next(a.title for a in self.m.agenda if a.id == q.agenda_item_id)

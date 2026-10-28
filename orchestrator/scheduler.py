@@ -121,6 +121,13 @@ class RuleScorer:
         novelty = 1.0 - max([similarity(gist, s) for s in said_in_item] or [0.0])
         return hand_score(relevance, confidence, novelty, self.addressed(bot_id, text), penalty), gist
 
+    def add_bot(self, bot_id: ID, brief: Brief, aliases: list[str]) -> None:
+        """会中加入的 bot：登记 brief 与称呼，丢掉可能残留的旧索引 / 称呼正则（索引按 brief 惰性重建）。"""
+        self.briefs[bot_id] = brief
+        self.aliases[bot_id] = list(aliases)
+        self._index.pop(bot_id, None)
+        self._alias_re.pop(bot_id, None)
+
     # —— 异步二次打分的钩子（规则版什么都不做）——
     def bind(self, deliver: Callable[[Millis, dict], None]) -> None:
         pass
