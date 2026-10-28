@@ -16,7 +16,7 @@ from aiohttp import web
 from livekit import api
 
 HERE = Path(__file__).parent
-SAFE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
+SAFE = re.compile(r"[A-Za-z0-9_\-]{1,64}")  # use fullmatch: `$` would accept a trailing newline
 
 
 def _env(name: str) -> str:
@@ -29,7 +29,7 @@ def _env(name: str) -> str:
 async def token(request: web.Request) -> web.Response:
     room = request.query.get("room", "meeting-dev")
     identity = request.query.get("identity") or os.environ.get("MEETING_HUMAN_IDENTITY", "host")
-    if not SAFE.match(room) or not SAFE.match(identity):
+    if not SAFE.fullmatch(room) or not SAFE.fullmatch(identity):
         raise web.HTTPBadRequest(text="room/identity must match [A-Za-z0-9_-]{1,64}")
 
     at = (
@@ -50,10 +50,19 @@ async def token(request: web.Request) -> web.Response:
 RUNS = HERE.parent / "runs"
 
 
-def _run_dir(request: web.Request) -> Path:
-    run = request.match_info["run"]
+def _safe_run(run: str) -> Path | None:
+    """runs/<run> if the id is plain and the directory really lives under runs/ (no symlink escape)."""
+    if not SAFE.fullmatch(run):
+        return None
     d = RUNS / run
-    if not SAFE.match(run) or not d.is_dir():
+    if not d.is_dir() or RUNS.resolve() not in d.resolve().parents:
+        return None
+    return d
+
+
+def _run_dir(request: web.Request) -> Path:
+    d = _safe_run(request.match_info["run"])
+    if d is None:
         raise web.HTTPNotFound(text="no such run")
     return d
 
@@ -62,7 +71,9 @@ async def replay_events(request: web.Request) -> web.Response:
     """回放：返回 runs/<run>/events.jsonl（编排器领域事件）+ 音频对齐偏移。只读、只限 runs/ 下。"""
     import json
     d = _run_dir(request)
-    evs = [json.loads(l) for l in (d / "events.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+    if not (d / "events.jsonl").is_file():
+        raise web.HTTPNotFound(text="no events for this run")
+    evs = [json.loads(ln) for ln in (d / "events.jsonl").read_text(encoding="utf-8").splitlines() if ln.strip()]
     offset_ms = 0.0
     man = d / "audio" / "manifest.json"
     if man.exists():
@@ -82,13 +93,16 @@ async def replay_levels(request: web.Request) -> web.Response:
     t0 = json.loads(man.read_text()).get("meeting_t0_epoch_ms", 0)
     out: dict = {}
     for line in lv.read_text().splitlines():
-        x = json.loads(line); k = int((x["t_ms"] - t0) // 50)
-        if k < 0: continue
+        x = json.loads(line)
+        k = int((x["t_ms"] - t0) // 50)
+        if k < 0:
+            continue
         arr = out.setdefault(x["id"], {})
         arr[k] = max(arr.get(k, -120.0), x["db"])
     tracks = {}
     for ident, m in out.items():
-        n = max(m) + 1; tracks[ident] = [round(m.get(i, -120.0), 1) for i in range(n)]
+        n = max(m) + 1
+        tracks[ident] = [round(m.get(i, -120.0), 1) for i in range(n)]
     return web.json_response({"step_ms": 50, "tracks": tracks})
 
 
@@ -103,11 +117,15 @@ async def replay_minutes(request: web.Request) -> web.Response:
 
 
 async def replay_audio(request: web.Request) -> web.FileResponse:
-    return web.FileResponse(_run_dir(request) / "audio" / "mix.wav")
+    f = _run_dir(request) / "audio" / "mix.wav"
+    if not f.is_file():
+        raise web.HTTPNotFound(text="no audio for this run")
+    return web.FileResponse(f)
 
 
 async def replay_list(_: web.Request) -> web.Response:
-    runs = sorted(p.name for p in RUNS.iterdir() if p.is_dir() and (p / "events.jsonl").exists()) if RUNS.is_dir() else []
+    runs = sorted(p.name for p in RUNS.iterdir()
+                  if _safe_run(p.name) and (p / "events.jsonl").exists()) if RUNS.is_dir() else []
     return web.json_response({"runs": runs})
 
 
