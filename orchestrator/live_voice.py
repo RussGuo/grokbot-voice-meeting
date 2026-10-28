@@ -107,7 +107,7 @@ class MeetingVoiceLayer(LiveKitVoiceLayer):
             stat["total_ms"] = (time.perf_counter() - t0) * 1000
             st = ps.stats
             stat.update(llm=bool(st.get("llm")), path=st.get("path"), ok=not st.get("fallback"))
-            for k in ("header_ms", "fallback", "guard", "act", "truncated"):
+            for k in ("header_ms", "fallback", "guard", "act", "truncated", "inline", "inline_wait_ms"):
                 if k in st:
                     stat[k] = st[k]
             if "header_ms" in st:

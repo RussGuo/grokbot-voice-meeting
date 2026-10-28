@@ -242,3 +242,25 @@ def minutes_labels(lang: str | None) -> dict[str, str]:
         "action": "- {owner}：{title}（{status}）",
         "deferred": "- {who}：{q}",
     }
+
+
+# ———————————————————— 当场问本体（inline principal）————————————————————
+
+def inline_principal_lines(lang: str | None) -> dict[str, str]:
+    """分身当场问本体时说的三句话：filler（先垫一句）/ answer（原样转述，answer 不改写）/ timeout（预算内没回）。"""
+    if normalize(lang) == "en":
+        return {
+            "filler": "One moment, let me check with my principal.",
+            "answer": "My principal says: {answer}",
+            "timeout": "My principal hasn't replied yet. Let's move on, and I'll add it once the reply arrives.",
+        }
+    return {
+        "filler": "稍等，我问一下本体。",
+        "answer": "本体说：{answer}",
+        "timeout": "本体还没回，我们先继续，回复到了我再补充。",
+    }
+
+
+def inline_tag(lang: str | None) -> str:
+    """纪要发言行的标记：这条是本体在本轮内当场答复的。"""
+    return "[answered in turn] " if normalize(lang) == "en" else "【当场答复】"

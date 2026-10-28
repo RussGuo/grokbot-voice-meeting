@@ -42,7 +42,7 @@ from meet.runtime import join_wait_s, make_run_id, runs_root  # noqa: E402
 from orchestrator.bots import load_example  # noqa: E402
 from orchestrator.config import llm_config, report  # noqa: E402
 from orchestrator.orchestrator import Orchestrator, monotonic_ms  # noqa: E402
-from orchestrator.planner import build_planner  # noqa: E402
+from orchestrator.planner import DEFAULT_INLINE_MS, build_planner  # noqa: E402
 from orchestrator.principal import principal_from_env  # noqa: E402
 from orchestrator.scene import load_scene_metadata  # noqa: E402
 from orchestrator.summarize import build_summarizer  # noqa: E402
@@ -73,6 +73,30 @@ def load_voice_stack():
 
 
 server = AgentServer(host="127.0.0.1", port=0)   # 健康检查端口只绑本机，不对外暴露
+
+
+class _LateAskHook:
+    """规划器比编排器先建（编排器要拿 voice，voice 要拿规划器），所以「当场问本体」的 hook 晚绑定。
+    未绑定 / 本体不支持当场答复 / 预算为 0 时返回 None，规划器就退回旧的慢路径。"""
+
+    def __init__(self) -> None:
+        self.orch = None
+
+    @property
+    def active(self) -> bool:       # InlineAsk.enabled 读它：没绑定就别让规划器改变任何旧行为
+        return self.orch is not None
+
+    def __call__(self, pid: str, question: str):
+        return self.orch.request_principal(pid, question) if self.orch is not None else None
+
+
+def inline_budget_ms() -> int:
+    """MEETING_PRINCIPAL_INLINE_MS：同一轮里等本体答复的毫秒数，默认 5000，0 关闭；非法值按默认。"""
+    raw = (os.environ.get("MEETING_PRINCIPAL_INLINE_MS") or "").strip()
+    try:
+        return max(0, int(raw)) if raw else DEFAULT_INLINE_MS
+    except ValueError:
+        return DEFAULT_INLINE_MS
 
 
 async def _accept(req):
@@ -155,9 +179,11 @@ async def entrypoint(ctx: JobContext):
              cfg.resolve_asr_provider(), cfg.resolve_tts_provider())
     lang = getattr(meeting, "language", "zh")
     # 有 key：LLM 规划器决定说什么（护栏在代码里）；没 key：退回 FakeLLM 规则台词
+    ask_hook = _LateAskHook()
     voice = MeetingVoiceLayer(cfg, session, vad=adapters.make_vad(), room=ctx.room, human_id=human,
-                              planner=build_planner(meeting, briefs, chat, lang), chat=chat, moderator_id=mod,
-                              language=lang)
+                              planner=build_planner(meeting, briefs, chat, lang, ask_hook=ask_hook,
+                                                    inline_ms=inline_budget_ms()),
+                              chat=chat, moderator_id=mod, language=lang)
     await session.start(voice.agent_for(mod), room=ctx.room, room_options=room_options(cfg))
     speakers = None
     if os.environ.get("MEETING_MULTI_IDENTITY", "1") != "0":   # 每个 bot 独立参会者 + 独立音轨
@@ -186,6 +212,10 @@ async def entrypoint(ctx: JobContext):
                         scorer_chat=chat,                          # MEETING_SCORER=llm 时才启用二次打分
                         addable_bots=addable_bots(registry, (p.id for p in meeting.participants)))
     voice.token_valid = orch.token_valid
+    if orch.principal.supports_inline and inline_budget_ms() > 0:     # defer 永远不答，不开快路径
+        ask_hook.orch = orch
+    log.info("本体 %s；当场答复预算 %d ms（%s）", type(orch.principal).__name__, inline_budget_ms(),
+             "开" if ask_hook.orch is not None else "关")
 
     # —— 给网页：领域事件原样转发到 meeting.events；网页按钮经 meeting.control 进来（只认用户）——
     pending_pub: set = set()

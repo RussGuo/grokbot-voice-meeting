@@ -15,6 +15,14 @@ SOFT_BREAK = set("，,、 ：:")
 DEFAULT_MAX_CHARS = 20
 
 
+class _Flush(str):
+    """空串标记：规划器 yield 它表示「缓冲里的半句现在就送 TTS」。
+    当场问本体时，先垫的那句话后面要等好几秒，英文句号不在 SENT_END 里，不 flush 的话末尾几个词会卡在缓冲里。"""
+
+
+FLUSH = _Flush("")
+
+
 @dataclass
 class Segment:
     token_id: str
@@ -85,7 +93,7 @@ async def pump_segments(source: Union[AsyncIterable[str], Iterable[str]], token_
     async for piece in _iter():
         if not is_valid(token_id):
             return {"sent": seq, "stopped": True, "first_segment_ms": first}
-        for s in ch.feed(piece):
+        for s in (ch.flush() if piece is FLUSH else ch.feed(piece)):
             if not await _emit(s):
                 return {"sent": seq, "stopped": True, "first_segment_ms": first}
     rest = ch.flush()
