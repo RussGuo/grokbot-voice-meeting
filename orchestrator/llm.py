@@ -35,12 +35,24 @@ def thinking_body(thinking: Optional[str]) -> Optional[dict]:
 
 
 class DeepSeekChat:
+    """OpenAI-compatible chat. DeepSeek is the default; any base_url works the same way.
+
+    The class name is kept so existing imports do not break. Provider ``mock`` is rejected:
+    callers should use MockChat / FakeLLM when there is no key.
+    """
+
     def __init__(self, cfg: Optional[LLMConfig] = None):
         self.cfg = cfg or llm_config()
-        if self.cfg.provider != "deepseek":
-            raise RuntimeError("未配置 DEEPSEEK_API_KEY，不能使用真实 LLM（单测请用 FakeLLM）")
+        if self.cfg.provider == "mock" or not self.cfg.api_key:
+            raise RuntimeError("未配置 LLM API key，不能使用真实 LLM（单测请用 FakeLLM）")
         from openai import OpenAI
         self.client = OpenAI(base_url=self.cfg.base_url, api_key=self.cfg.api_key)
+
+    def _thinking(self, thinking: Optional[str]) -> Optional[str]:
+        # DeepSeek accepts extra_body.thinking. Other OpenAI-compatible servers usually do not.
+        if self.cfg.provider != "deepseek":
+            return None
+        return thinking
 
     def stream(self, messages: list[dict], *, max_tokens: int = 64, temperature: float = 0.7,
                model: Optional[str] = None, thinking: Optional[str] = None) -> StreamResult:
@@ -52,7 +64,7 @@ class DeepSeekChat:
         rchars = 0
         ch = SentenceChunker()
         kw = {}
-        body = thinking_body(thinking)
+        body = thinking_body(self._thinking(thinking))
         if body:
             kw["extra_body"] = body
         resp = self.client.chat.completions.create(
@@ -81,13 +93,18 @@ class DeepSeekChat:
             first_seg = total                      # 整段不足一句：流结束时 flush
         return StreamResult("".join(parts), ttft, total, usage, first_any, first_seg, rchars)
 
+    def complete(self, messages: list[dict], *, max_tokens: int = 800, temperature: float = 0.2) -> str:
+        """One-shot completion used by brief summarization. Thinking stays off."""
+        thinking = "disabled" if self.cfg.provider == "deepseek" else None
+        return self.stream(messages, max_tokens=max_tokens, temperature=temperature, thinking=thinking).text
+
     async def astream_text(self, messages: list[dict], *, max_tokens: int = 200,
                            thinking: Optional[str] = "disabled"):
         """异步逐段产出正文（main.py 送 TTS 用）。语音场景默认关思考以降首 token。"""
         from openai import AsyncOpenAI
         client = AsyncOpenAI(base_url=self.cfg.base_url, api_key=self.cfg.api_key)
         kw = {}
-        body = thinking_body(thinking)
+        body = thinking_body(self._thinking(thinking))
         if body:
             kw["extra_body"] = body
         resp = await client.chat.completions.create(model=self.cfg.model, messages=messages,
@@ -112,4 +129,10 @@ class MockChat:
 
 def make_chat(cfg: Optional[LLMConfig] = None):
     cfg = cfg or llm_config()
-    return DeepSeekChat(cfg) if cfg.provider == "deepseek" else MockChat()
+    if cfg.provider == "mock" or not cfg.api_key:
+        return MockChat()
+    return DeepSeekChat(cfg)
+
+
+# Public alias: every OpenAI-compatible provider, not only DeepSeek.
+OpenAICompatChat = DeepSeekChat

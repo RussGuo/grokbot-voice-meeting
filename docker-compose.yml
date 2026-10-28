@@ -1,0 +1,19 @@
+services:
+  worker:
+    build: .
+    env_file: .env
+    command: ["meet", "worker", "start"]
+    restart: unless-stopped
+    volumes:
+      - ./runs:/app/runs
+
+  web:
+    profiles: ["web"]
+    build: .
+    env_file: .env
+    command: ["python", "web/token_server.py"]
+    environment:
+      WEB_HOST: 0.0.0.0
+      WEB_PORT: "8787"
+    ports:
+      - "8787:8787"

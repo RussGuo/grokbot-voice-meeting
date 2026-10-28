@@ -25,5 +25,8 @@ def make_tts(cfg: VoiceConfig, bot_id: str, provider: Optional[str] = None) -> l
     if p == "aliyun":
         from .aliyun import AliyunCosyVoiceTTS
         return AliyunCosyVoiceTTS(voice=v.aliyun_voice, sample_rate=cfg.tts_sample_rate)
+    if p == "openai":
+        from providers.openai_speech import make_openai_tts
+        return make_openai_tts(cfg, v)
     from .local_kokoro import KokoroTTS
     return KokoroTTS(models_dir=cfg.models_dir, sid=v.local_sid, speed=v.speed)

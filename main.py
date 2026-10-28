@@ -32,7 +32,8 @@ if str(VOICE_DIR) not in sys.path:
 
 from dotenv import load_dotenv
 
-load_dotenv(ROOT / ".env")  # 读取 .env；绝不打印任何值
+load_dotenv(Path.cwd() / ".env")  # 先读当前目录，不覆盖已有变量
+load_dotenv(ROOT / ".env")  # 仓库根目录；绝不打印任何值
 
 from livekit.agents import AgentServer, JobContext, cli  # noqa: E402
 
@@ -40,7 +41,8 @@ from orchestrator.bots import load_example  # noqa: E402
 from orchestrator.config import llm_config, report  # noqa: E402
 from orchestrator.fake_llm import FakeLLM  # noqa: E402
 from orchestrator.orchestrator import Orchestrator, monotonic_ms  # noqa: E402
-from orchestrator.principal import MockPrincipal  # noqa: E402
+from orchestrator.principal import principal_from_env  # noqa: E402
+from orchestrator.scene import load_scene_metadata  # noqa: E402
 
 log = logging.getLogger("voice-meeting")
 logging.basicConfig(level=logging.INFO)
@@ -74,37 +76,75 @@ async def _accept(req):
     await req.accept(name=os.environ.get("MEETING_AGENT_DISPLAY_NAME", "会议编排"))
 
 
+def _runtime_meeting(ctx: JobContext):
+    """Job metadata (from `meet`) wins. Sample scenarios remain the fallback for the old scripts."""
+    job_meta = getattr(getattr(ctx, "job", None), "metadata", None)
+    loaded = load_scene_metadata(job_meta)
+    if loaded:
+        return loaded, "scene"
+    scenario = os.environ.get("MEETING_SCENARIO", "sim_v1")
+    mode = os.environ.get("MEETING_MODERATOR_MODE") or None
+    meeting, briefs = load_example(scenario=scenario, moderator_mode=mode)
+    return (meeting, briefs, {}), scenario
+
+
+def _apply_env_overrides(meeting) -> None:
+    lang = os.environ.get("MEETING_LANG")
+    if lang in ("zh", "en"):
+        meeting.language = lang
+    name = (os.environ.get("MEETING_HUMAN_NAME") or "").strip()
+    if name:
+        meeting.participant(meeting.voice.linked_human_id).display_name = name
+
+
 @server.rtc_session(agent_name=os.environ.get("LIVEKIT_AGENT_NAME", "voice-meeting"), on_request=_accept)
 async def entrypoint(ctx: JobContext):
     log.info("环境变量是否存在：%s", report())
     adapters, build_session, room_options, MeetingVoiceLayer = load_voice_stack()
-    scenario = os.environ.get("MEETING_SCENARIO", "sim_v1")
     run_id = os.environ.get("MEETING_RUN_ID") or time.strftime("%Y%m%d-%H%M%S")
     run_dir = ROOT / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
-    meeting, briefs = load_example(scenario=scenario)   # 主持默认 chiefOfStaff；linked_human_id = MEETING_HUMAN_IDENTITY
+    (meeting, briefs, voices), scenario = _runtime_meeting(ctx)
+    if scenario != "scene":
+        # Dispatch metadata was empty. Room metadata is a second chance, but only after connect.
+        pass
+    _apply_env_overrides(meeting)
     meeting.voice.room = ctx.room.name
     human = meeting.voice.linked_human_id
     mod = meeting.moderator.participant_id
     log.info("场景 %s，run_id %s，房间 %s，主持 %s(%s)", scenario, run_id, ctx.room.name, mod, meeting.moderator.mode)
 
     await ctx.connect()
+    if scenario != "scene":
+        loaded = load_scene_metadata(getattr(ctx.room, "metadata", None))
+        if loaded:
+            meeting, briefs, voices = loaded
+            _apply_env_overrides(meeting)
+            meeting.voice.room = ctx.room.name
+            scenario = "scene"
+            human = meeting.voice.linked_human_id
+            mod = meeting.moderator.participant_id
+            log.info("房间 metadata 提供了场景，主持 %s", mod)
     log.info("等待 %s 入会", human)
     await asyncio.wait_for(ctx.wait_for_participant(identity=human), timeout=60)
     cfg = adapters.config()
     cfg.human_identity = human
+    if voices:
+        from voice_layer.config import apply_voices  # type: ignore
+        apply_voices(cfg, voices)
     cfg.interruption.framework_enabled = False             # 打断由编排器 + 语音层 HumanVad 判定
     cfg.interruption.discard_audio_if_uninterruptible = False   # 必须 False（语音队友实测）
     session = build_session(cfg, adapters.make_vad(), stt=adapters.make_stt())
     lc = llm_config()
     chat = None
-    if lc.provider == "deepseek":
+    if lc.provider != "mock":
         from orchestrator.llm import DeepSeekChat
         chat = DeepSeekChat(lc)
     log.info("LLM：%s（model=%s，thinking=disabled）；ASR=%s；TTS=%s", lc.provider, lc.model,
              cfg.resolve_asr_provider(), cfg.resolve_tts_provider())
     voice = MeetingVoiceLayer(cfg, session, vad=adapters.make_vad(), room=ctx.room, human_id=human,
-                              planner=FakeLLM(meeting, briefs), chat=chat, moderator_id=mod)
+                              planner=FakeLLM(meeting, briefs), chat=chat, moderator_id=mod,
+                              language=getattr(meeting, "language", "zh"))
     await session.start(voice.agent_for(mod), room=ctx.room, room_options=room_options(cfg))
     speakers = None
     if os.environ.get("MEETING_MULTI_IDENTITY", "1") != "0":   # 每个 bot 独立参会者 + 独立音轨
@@ -122,7 +162,7 @@ async def entrypoint(ctx: JobContext):
     t0, t0_epoch = monotonic_ms(), time.time() * 1000
     (run_dir / "clock.json").write_text(json.dumps({"t0_epoch_ms": t0_epoch, "room": ctx.room.name}), "utf-8")
     orch = Orchestrator(meeting, briefs, voice,
-                        principal_factory=lambda o: MockPrincipal(o.schedule_timer, delay_ms=20_000),
+                        principal_factory=principal_from_env,
                         clock=lambda: monotonic_ms() - t0)
     voice.token_valid = orch.token_valid
 

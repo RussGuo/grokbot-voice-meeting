@@ -1,0 +1,24 @@
+name: Feature
+description: A provider, a command, or a meeting behavior you want
+title: ""
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Who is blocked, and what they are trying to do.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: If this is a new provider, say which interface in providers/base.py it implements.
+  - type: checkboxes
+    id: free
+    attributes:
+      label: Constraints
+      options:
+        - label: This can work on free-tier or local software
+          required: false

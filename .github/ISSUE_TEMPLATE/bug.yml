@@ -1,0 +1,34 @@
+name: Bug
+description: Something in a meeting, the CLI, or the worker misbehaves
+title: ""
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you expected, and what you saw. Do not paste API keys or join tokens.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: Commands, meet flags, and whether this was `meet demo` or a live room.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - meet CLI
+        - worker / turn taking
+        - speech providers
+        - join page
+        - minutes / follow-up
+        - other
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit

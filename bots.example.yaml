@@ -1,0 +1,31 @@
+# Copy to bots.yaml (gitignored) or to ~/.config/grokbot-voice-meeting/bots.yaml.
+# Context is what YOU or your Grok Bot actually know. Do not paste invented numbers.
+# `meet` summarizes each context into a brief and marks gaps as unknown.
+
+moderator:
+  id: moderator
+  display_name: Host
+  # voice: zh_male_m191_uranus_bigtts   # optional; must be in config/voices.json pool
+
+bots:
+  pm:
+    display_name: Product
+    aliases: [PM, 产品]
+    principal: pm          # id used when a question is forwarded to the real bot
+    # voice: zh_female_vv_uranus_bigtts
+    context: |
+      Product owns scope and sequencing.
+      Can commit:
+      - write the spec
+      Must ask:
+      - budget
+  eng:
+    display_name: Engineering
+    aliases: [Eng, 工程]
+    principal: eng
+    context_file: contexts/eng.md
+  growth:
+    display_name: Growth
+    aliases: [Growth, 增长]
+    context: |
+      No metrics were exported for this bot.

@@ -207,7 +207,7 @@ class Scheduler:
     def on_agenda_changed(self) -> None:
         self.s.reinserted = {}
         self.s.bot_chain = 0
-        self.s.cues = [c for c in self.s.cues if c.intent in ("recap",)]
+        self.s.cues = [c for c in self.s.cues if c.intent in ("recap", "directive")]
 
     def recent_share(self, pid: ID, agenda_item_id: ID) -> float:
         per = self.s.talk_ms.get(agenda_item_id, {})
@@ -225,6 +225,9 @@ class Scheduler:
         actions: list[str] = []
         if not floor_free or human_vad_active:     # 半双工 + 人类优先
             return None, actions
+        for c in self.s.cues:          # 用户刚点名：高于本体插回和普通举手
+            if c.intent == "directive":
+                return Candidate(c.target, "moderatorCue", 1.0, c, 0.0), actions
         for c in self.s.cues:          # 议程项开场优先于一切 bot 发言（人类除外）
             if c.intent in ("open", "open_item"):
                 return Candidate(c.target, "moderatorCue", 1.0, c, 0.0), actions

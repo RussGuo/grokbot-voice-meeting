@@ -130,6 +130,7 @@ class Meeting(Serializable):
     initiator: ID
     participants: list[Participant]
     agenda: list[AgendaItem]
+    language: str = "zh"          # zh | en；提示词与主持稿的语言
     status: Literal["inviting", "preparing", "live", "closing", "post", "archived"] = "inviting"
     current_agenda_idx: int = 0
     moderator: ModeratorConfig = field(default_factory=ModeratorConfig)

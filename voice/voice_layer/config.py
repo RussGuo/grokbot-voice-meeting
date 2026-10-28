@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Optional
 
@@ -64,45 +64,40 @@ class VadConfig:
 @dataclass
 class BotVoice:
     bot_id: str
-    provider: str = "auto"              # auto|volc|aliyun|local
+    provider: str = "auto"              # auto|volc|aliyun|openai|local
     local_sid: int = 47                 # kokoro v1.1 speaker id
     volc_speaker: str = "zh_female_vv_uranus_bigtts"
     aliyun_voice: str = "longxiaochun_v3"
+    openai_voice: str = "alloy"         # livekit-plugins-openai TTS voice name
     speed: float = 1.0
 
 
-DEFAULT_BOT_VOICES: dict[str, BotVoice] = {
-    # volc_speaker：豆包语音合成模型 2.0 官方音色列表 https://www.volcengine.com/docs/6561/1257544
-    #   （2026-10-27 用 seed-tts-2.0 实际合成验证过，试听见 voice/samples/）
-    # local_sid：sherpa-onnx kokoro-int8-multi-lang-v1_1 说话人表（45-52 为中文音色）
-    "moderator": BotVoice("moderator", local_sid=50, volc_speaker="zh_male_huolixiaoge_uranus_bigtts"),   # 活力小哥 2.0（活泼年轻）
-    "pm_bot": BotVoice("pm_bot", local_sid=47, volc_speaker="zh_female_qingxinnvsheng_uranus_bigtts"),   # 清新女声 2.0（清亮女声）
-    "eng_bot": BotVoice("eng_bot", local_sid=49, volc_speaker="zh_male_m191_uranus_bigtts"),             # 云舟 2.0（沉稳男声）
-    "bot_c": BotVoice("bot_c", local_sid=48, volc_speaker="zh_female_vv_uranus_bigtts"),                 # Vivi 2.0（成本 bot）
-    "bot_e": BotVoice("bot_e", local_sid=45, volc_speaker="zh_female_xiaohe_uranus_bigtts"),             # xiaohe 2.0（2026-10-28 实测可用）
-    "bot_f": BotVoice("bot_f", local_sid=51, volc_speaker="zh_male_taocheng_uranus_bigtts"),             # taocheng 2.0（真人用户参会时可用；再跑模拟人类时与 sim_human 冲突）
-    "bot_g": BotVoice("bot_g", local_sid=52, volc_speaker="zh_female_shuangkuaisisi_uranus_bigtts"),     # shuangkuaisisi 2.0（备用，2026-10-28 实测可用）
-    "voice_ruyayichen": BotVoice("voice_ruyayichen", local_sid=51, volc_speaker="zh_male_ruyayichen_uranus_bigtts"),  # 儒雅逸辰 2.0，2026-10-28 实测可用
-    "voice_shuangkuaisisi": BotVoice("voice_shuangkuaisisi", local_sid=52, volc_speaker="zh_female_shuangkuaisisi_uranus_bigtts"),  # 爽快思思 2.0，2026-10-28 实测可用
-    # 模拟用户（不是 bot，仅用于预合成人类台词；与上面 4 个互不共用）
-    "sim_human": BotVoice("sim_human", local_sid=46, volc_speaker="zh_male_taocheng_uranus_bigtts"),           # 2026-10-27 seed-tts-2.0 实测可用
-}
+def catalog_path() -> Path:
+    """Voice catalog is data, not code. Precedence: VOICE_CATALOG, repo config/voices.json, packaged copy."""
+    override = os.environ.get("VOICE_CATALOG")
+    if override:
+        return Path(override)
+    repo = Path(__file__).resolve().parents[2] / "config" / "voices.json"
+    if repo.is_file():
+        return repo
+    return Path(__file__).with_name("voices.json")
 
-# meeting_example.json 里 agent_profile.tts_voice 的别名 → 上面的 bot 音色
-VOICE_ALIASES = {
-    "voice_moderator_neutral": "moderator",
-    "voice_pm_female_warm": "pm_bot",
-    "voice_eng_male_calm": "eng_bot",
-    "voice_cos_female_crisp": "bot_c",
-    "voice_sim_human": "sim_human",
-    "voice_slot_e": "bot_e",
-    "voice_slot_f": "bot_f",
-    "voice_slot_g": "bot_g",
-    # orchestrator/bots/sim_v1：增长分身用活力小哥（明亮男声），与 sim_v1 其余 3 个音色互不共用
-    "voice_growth_male_bright": "moderator",
-    "growth_bot": "moderator",
-    "chief_of_staff": "bot_c",
-}
+
+def _load_catalog(path: Path | None = None) -> dict:
+    path = path or catalog_path()
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _botvoice(bot_id: str, data: dict) -> BotVoice:
+    known = {f.name for f in fields(BotVoice)}
+    kw = {k: v for k, v in data.items() if k in known}
+    kw["bot_id"] = bot_id
+    return BotVoice(**kw)
+
+
+_CATALOG = _load_catalog()
+DEFAULT_BOT_VOICES: dict[str, BotVoice] = {k: _botvoice(k, v) for k, v in _CATALOG.get("bots", {}).items()}
+VOICE_ALIASES: dict[str, str] = dict(_CATALOG.get("aliases", {}))
 
 
 @dataclass
@@ -116,9 +111,9 @@ class VoiceConfig:
     vad: VadConfig = field(default_factory=VadConfig)
     bots: dict[str, BotVoice] = field(default_factory=lambda: {k: BotVoice(**v.__dict__) for k, v in DEFAULT_BOT_VOICES.items()})
     volc_asr_resource_id: str = field(default_factory=lambda: os.environ.get("VOLC_ASR_RESOURCE_ID", "volc.seedasr.sauc.duration"))
-    # ASR 热词，逗号分隔（VOLC_ASR_HOTWORDS）；默认是本项目会议的高频术语
+    # ASR 热词，逗号分隔（VOLC_ASR_HOTWORDS）。默认是通用会议词，按你的议题改。
     asr_hotwords: list = field(default_factory=lambda: [w.strip() for w in os.environ.get(
-        "VOLC_ASR_HOTWORDS", "对账,本体,分身,多音轨,慢路径,需求文档,v1,行动项,Chief of Staff").split(",") if w.strip()])
+        "VOLC_ASR_HOTWORDS", "议程,行动项,纪要,主持").split(",") if w.strip()])
     volc_tts_resource_id: str = field(default_factory=lambda: os.environ.get("VOLC_TTS_RESOURCE_ID", "seed-tts-2.0"))
     tts_sample_rate: int = 24000
 
@@ -141,8 +136,16 @@ class VoiceConfig:
         return self.bots[bot_id]
 
 
+def openai_credentials_present() -> bool:
+    return bool(_env("OPENAI_API_KEY") or _env("LLM_API_KEY"))
+
+
 def _resolve(p: str) -> str:
-    """auto：火山有凭证用火山，否则阿里有 key 用阿里，否则本地。显式指定但缺凭证 => 回退本地并记录原因。"""
+    """auto：火山有凭证用火山，否则阿里有 key 用阿里，否则本地。
+
+    openai 只在显式选择时启用（VOICE_ASR_PROVIDER / VOICE_TTS_PROVIDER=openai）。
+    显式指定但缺凭证 => 回退本地。
+    """
     p = (p or "auto").lower()
     if p == "auto":
         if volc_credentials_present():
@@ -153,6 +156,8 @@ def _resolve(p: str) -> str:
     if p == "volc" and not volc_credentials_present():
         return "local"
     if p == "aliyun" and not dashscope_credentials_present():
+        return "local"
+    if p == "openai" and not openai_credentials_present():
         return "local"
     return p
 
@@ -178,19 +183,9 @@ def load_config(path: Optional[str | Path] = None) -> VoiceConfig:
     return cfg
 
 
-# —— 自动分配音色（meet.py 用）——
-# 只放 2026-10-27/28 用 seed-tts-2.0 实际合成验证过的音色（官方列表 https://www.volcengine.com/docs/6561/1257544）
-VERIFIED_VOICE_POOL: list[tuple[str, str]] = [   # (volc_speaker, 性别 M/F)
-    ("zh_female_vv_uranus_bigtts", "F"),
-    ("zh_male_m191_uranus_bigtts", "M"),
-    ("zh_female_qingxinnvsheng_uranus_bigtts", "F"),
-    ("zh_male_huolixiaoge_uranus_bigtts", "M"),
-    ("zh_female_xiaohe_uranus_bigtts", "F"),
-    ("zh_male_ruyayichen_uranus_bigtts", "M"),
-    ("zh_female_shuangkuaisisi_uranus_bigtts", "F"),
-    ("zh_male_taocheng_uranus_bigtts", "M"),        # 模拟用户也用它：sim_human=True 时不分配
-]
-SIM_HUMAN_SPEAKER = "zh_male_taocheng_uranus_bigtts"
+# 音色池来自 catalog（config/voices.json）。性别用于男女声交替分配。
+VERIFIED_VOICE_POOL: list[tuple[str, str]] = [(item["id"], item["gender"]) for item in _CATALOG.get("pool", [])]
+SIM_HUMAN_SPEAKER = _CATALOG.get("sim_human") or "zh_male_taocheng_uranus_bigtts"
 
 
 def assign_voices(bot_ids: list[str], *, sim_human: bool = False,

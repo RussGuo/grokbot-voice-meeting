@@ -59,20 +59,94 @@ def meeting_meta(events: list[dict]) -> dict:
     return next((e["data"].get("payload", {}) for e in events if e["type"] == "MeetingCreated"), {})
 
 
-def tracks(run: Path) -> dict[str, tuple[Path, int]]:
-    """participant_id → (wav 路径, start_ms)。"""
+class Track:
+    """One wav plus when its first sample sits on the meeting clock.
+
+    `shared` marks the worker's own participant. With per-bot identities that track is silence
+    (RoutingAudioOutput keeps the agent session alive with silent frames). Measuring it reports
+    a stop time that has nothing to do with the bot who was actually talking.
+
+    A plain class, not a dataclass: acceptance.py is loaded by path in tests, and dataclass
+    looks up the module in sys.modules.
+    """
+
+    def __init__(self, path: Path, start_ms: int = 0, shared: bool = False):
+        self.path = path
+        self.start_ms = start_ms
+        self.shared = shared
+
+    def __iter__(self):
+        yield self.path
+        yield self.start_ms
+
+    def __getitem__(self, i: int):
+        return (self.path, self.start_ms)[i]
+
+
+def tracks(run: Path) -> dict[str, Track]:
+    """participant_id → Track. A bare wav is also indexed by its filename stem."""
     adir = run / "audio"
-    res: dict[str, tuple[Path, int]] = {}
+    res: dict[str, Track] = {}
     if not adir.is_dir():
         return res
     man = {}
     if (adir / "manifest.json").exists():
         man = json.loads((adir / "manifest.json").read_text("utf-8")).get("tracks", {})
     for pid, t in man.items():
-        res[pid] = (adir / t["file"], int(t.get("start_ms", 0)))
+        res[pid] = Track(adir / t["file"], int(t.get("start_ms", 0)), shared=bool(t.get("shared_identity")))
     for f in adir.glob("*.wav"):
-        res.setdefault(f.stem, (f, 0))
+        res.setdefault(f.stem, Track(f, 0, shared=False))
     return res
+
+
+def window_peak_db(track: Track, around_ms: int, radius_ms: int = 2_000) -> float:
+    db = frame_db(track.path)
+    i0 = max(0, (around_ms - radius_ms - track.start_ms) // FRAME_MS)
+    i1 = min(len(db), (around_ms + radius_ms - track.start_ms) // FRAME_MS + 1)
+    if i0 >= i1 or not db:
+        return -120.0
+    return max(db[i0:i1])
+
+
+def pick_bot_track(trk: dict[str, Track], bot: str, human: str | None, around_ms: int) -> Track | None:
+    """Prefer a wav that belongs to `bot` and actually contains speech.
+
+    Manifest entries flagged shared_identity point at the worker's silent bus. Those lose to any
+    dedicated bot file (identity or filename contains the bot id).
+    """
+    dedicated: list[Track] = []
+    shared: list[Track] = []
+    seen: set[Path] = set()
+    for key, t in trk.items():
+        if human and key == human:
+            continue
+        if t.path in seen:
+            continue
+        seen.add(t.path)
+        name_hit = key == bot or bot in t.path.name
+        if t.shared and not name_hit:
+            shared.append(t)
+            continue
+        if t.shared and name_hit:
+            shared.append(t)
+            continue
+        if name_hit:
+            dedicated.append(t)
+    pool = dedicated or shared
+    if not pool:
+        pool = [t for k, t in trk.items() if k != human]
+    best: Track | None = None
+    best_db = -1e9
+    for t in pool:
+        try:
+            db = window_peak_db(t, around_ms)
+        except (OSError, ValueError, wave.Error):
+            continue
+        # A dedicated track wins a tie against the silent agent bus.
+        score = db + (5.0 if not t.shared else 0.0)
+        if score > best_db:
+            best, best_db = t, score
+    return best
 
 
 def frame_db(path: Path) -> list[float]:
@@ -216,8 +290,10 @@ def c3_bargein(ev: list[dict], trk: dict, max_stop_ms: int, thr_db: float) -> Ch
     log_ok = log_ms is not None and 0 <= log_ms <= max_stop_ms
 
     audio_ok, audio_ms = False, None
-    if human in trk and bot in trk:
-        (hp, hs), (bp, bs) = trk[human], trk[bot]
+    bot_track = pick_bot_track(trk, bot, human, t_stop)
+    if human in trk and bot_track is not None:
+        hp, hs = trk[human].path, trk[human].start_ms
+        bp, bs = bot_track.path, bot_track.start_ms
         try:
             hdb, bdb = frame_db(hp), frame_db(bp)
             a_on = audio_onset(hdb, hs, (onset or t_stop) - 1500, t_stop + 500, thr_db)
@@ -225,11 +301,11 @@ def c3_bargein(ev: list[dict], trk: dict, max_stop_ms: int, thr_db: float) -> Ch
             if a_on is not None and a_off is not None:
                 audio_ms = a_off - a_on
                 audio_ok = 0 <= audio_ms <= max_stop_ms
-            c.detail.append(f"音频能量法（阈值 {thr_db}dBFS）：人声起点 {a_on}ms → bot 音轨静音 {a_off}ms，用时 {audio_ms}ms")
+            c.detail.append(f"音频能量法（阈值 {thr_db}dBFS，音轨 {bp.name}）：人声起点 {a_on}ms → bot 音轨静音 {a_off}ms，用时 {audio_ms}ms")
         except (OSError, ValueError, wave.Error) as exc:
             c.detail.append(f"音频读取失败：{exc}")
     else:
-        c.detail.append(f"缺少音轨：需要 audio/{human}.wav 和 audio/{bot}.wav")
+        c.detail.append(f"缺少音轨：需要 audio/{human}.wav 和 {bot} 的音轨")
     c.metrics["audio_ms"] = audio_ms
 
     dir_ok = False
@@ -293,7 +369,9 @@ def c5_outputs(run: Path, ev: list[dict]) -> Check:
         try:
             items = json.loads(f.read_text("utf-8"))
         except json.JSONDecodeError:
-            c.detail.append(f"{f.name}：不是合法 JSON"); act_ok = False; continue
+            c.detail.append(f"{f.name}：不是合法 JSON")
+            act_ok = False
+            continue
         good = f.stem in bots and isinstance(items, list) and items and all(i.get("owner_id") == f.stem for i in items)
         act_ok &= bool(good)
         c.detail.append(f"actions/{f.name}：{len(items) if isinstance(items, list) else '?'} 项{'' if good else '（owner 不符或非 bot）'}")
@@ -319,11 +397,15 @@ def c6_artifacts(run: Path, ev: list[dict] | None, trk: dict) -> Check:
     au_ok = bool(need)
     for pid in sorted(need):
         if pid not in trk or not trk[pid][0].exists():
-            c.detail.append(f"缺少音轨 audio/{pid}.wav"); au_ok = False; continue
+            c.detail.append(f"缺少音轨 audio/{pid}.wav")
+            au_ok = False
+            continue
         try:
             ms = wav_ms(trk[pid][0])
         except (OSError, wave.Error) as exc:
-            c.detail.append(f"audio/{pid}.wav 读取失败：{exc}"); au_ok = False; continue
+            c.detail.append(f"audio/{pid}.wav 读取失败：{exc}")
+            au_ok = False
+            continue
         if ms <= 0:
             au_ok = False
         c.detail.append(f"audio/{trk[pid][0].name}：{ms / 1000:.1f}s")
@@ -333,7 +415,6 @@ def c6_artifacts(run: Path, ev: list[dict] | None, trk: dict) -> Check:
         end_ev = next((e for e in ev if e["type"] == "MeetingEnded"), None)
         if cmd and end_ev:
             lag = end_ev["at"] - cmd[0]["at"]
-            mod = meeting_meta(ev).get("moderator_id")
             after = [e for e in ev if e["type"] == "UtteranceFinal" and e["at"] > cmd[0]["at"]
                      and e["data"]["utterance"]["speaker_id"] != meeting_meta(ev).get("linked_human_id")]
             end_ok = lag <= 5_000 and not after

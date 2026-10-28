@@ -19,22 +19,20 @@ from voice_layer.events import make_event  # type: ignore
 from voice_layer.livekit_layer import LiveKitVoiceLayer  # type: ignore
 
 from .chunker import pump_segments
+from .i18n import style as i18n_style
 
 log = logging.getLogger("live_voice")
-
-STYLE = ("你在一场多人语音会议里发言。只输出要说出口的话：口语中文，一到两句，不超过 50 字，"
-         "不要列表、不要 markdown、不要括号注释、不要自称 AI；"
-         "要点里没有的承诺或「去问本体」不要说。")
 
 
 class MeetingVoiceLayer(LiveKitVoiceLayer):
     def __init__(self, *a, planner: Callable[[str, Any], dict], chat=None, moderator_id: str = "",
-                 max_tokens: int = 120, **kw):
+                 max_tokens: int = 120, language: str = "zh", **kw):
         super().__init__(*a, llm_factory=lambda _pid: None, **kw)
         self.planner = planner
         self.chat = chat
         self.moderator_id = moderator_id
         self.max_tokens = max_tokens
+        self.language = language or "zh"
         self.token_valid: Callable[[str], bool] = lambda _t: True
         self.llm_stats: list[dict] = []      # 每次 LLM 调用：ttft_ms / first_seg_ms / total_ms / ok
 
@@ -48,9 +46,14 @@ class MeetingVoiceLayer(LiveKitVoiceLayer):
     def _messages(self, ctx, plan: dict) -> list[dict]:
         msgs = ctx.to_messages()
         must = plan["text"]
-        extra = f"{STYLE}\n这一轮你要表达的要点（可以换说法，但数字和结论不能改）：{must}"
+        extra = f"{i18n_style(self.language)}\n这一轮你要表达的要点（可以换说法，但数字和结论不能改）：{must}"
+        if self.language == "en":
+            extra = f"{i18n_style(self.language)}\nSay this, in your own words, without changing numbers or conclusions: {must}"
         if plan.get("commitments"):
-            extra += f"\n必须明确说你当场答应：{plan['commitments'][0]}。"
+            if self.language == "en":
+                extra += f"\nSay explicitly that you commit to: {plan['commitments'][0]}."
+            else:
+                extra += f"\n必须明确说你当场答应：{plan['commitments'][0]}。"
         msgs.append({"role": "user", "content": extra})
         return msgs
 
