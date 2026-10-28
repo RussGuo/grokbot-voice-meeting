@@ -13,6 +13,8 @@
   b. 头里的 commit 必须匹配 mandate.can_commit，否则中止流，改说安全话术并 ask_principal；
   c. relay（转述本体答案）不调 LLM，原样念；
   d. 被点名且 confidence < 0.6 → 问本体。
+  e. 笔记检索：有 context_index 时，成员发言前从「该 bot 自己」的完整笔记里取回相关原文放进提示词（上限 ~1200 字，每条带 id）；
+     头里的 sources 只保留真的取回过的 id，provenance=context 没有有效 sources 就降成 model。
 任何 LLM 错误 / 超时 / 头格式错 / 正文为空 → 回退 FakeLLM 的规划（文本与字段），原因记在 stats["fallback"]。
 主持人的程序性话术仍用模板；只有 fill_silence 可选用 LLM（失败回模板）。
 """
@@ -28,16 +30,18 @@ from typing import Any, AsyncIterator, Callable, Optional, Protocol, runtime_che
 from .fake_llm import CONFIDENCE_THRESHOLD, FakeLLM
 from .i18n import normalize
 from .models import ID, Brief, ChatCtxRecipe, Meeting
+from .retrieval import Hit, format_excerpts, turn_query
 
 log = logging.getLogger("planner")
 
 ACTS = ("speak", "ask_principal", "commit")
-PROVENANCES = ("brief", "snapshot", "model")
+PROVENANCES = ("brief", "snapshot", "model", "context")
 HEADER_MAX_CHARS = 400
 HEADER_TIMEOUT_S = 2.5
 STALL_TIMEOUT_S = 8.0        # 正文开始后，相邻两块之间最长等待；超时就地收尾（不再回退，已经开口了）
 DEFAULT_MAX_TOKENS = 160     # 含头
-FIELD_KEYS = ("provenance", "confidence", "commitments", "addressees", "ask_principal")
+FIELD_KEYS = ("provenance", "confidence", "commitments", "addressees", "ask_principal", "sources")
+EXCERPT_K, EXCERPT_CHARS = 3, 1200     # 每轮最多取回几段、提示词里原文总长上限
 
 _SAFE_ASK = {
     "zh": "这个我需要和本体确认后再答复。",
@@ -319,6 +323,17 @@ def _turn_prompt(lang: str, *, mandate_commit: list[str], mandate_ask: list[str]
     return "\n".join(lines)
 
 
+def _excerpt_prompt(lang: str, excerpts: str) -> str:
+    if lang == "en":
+        return ("Excerpts from your own notes (each starts with its id in brackets):\n" + excerpts + "\n"
+                "Besides your brief, you may use these excerpts when they answer the point. Do not state anything that is "
+                "not in your brief, these excerpts or what was said in the meeting. If you rely on an excerpt, set "
+                "provenance to \"context\" and add \"sources\":[ids] to the JSON line, e.g. \"sources\":[\"pm#3\"].")
+    return ("你自己笔记里的相关原文（每条以方括号里的 id 开头）：\n" + excerpts + "\n"
+            "除 brief 外，这些原文能回答时可以直接用。不要说 brief、这些原文和会上内容之外的事。"
+            "用了某条原文，就在 JSON 头里把 provenance 写成 \"context\"，并加上 \"sources\":[id]，例如 \"sources\":[\"pm#3\"]。")
+
+
 def _silence_prompt(lang: str, item: str) -> str:
     if lang == "en":
         return (f"As the neutral host, give a spoken recap of the discussion on \"{item}\" so far, using only the "
@@ -334,12 +349,13 @@ class LLMPlanner:
                  header_timeout: float = HEADER_TIMEOUT_S, header_max_chars: int = HEADER_MAX_CHARS,
                  max_tokens: int = DEFAULT_MAX_TOKENS, temperature: float = 0.4,
                  stall_timeout: float = STALL_TIMEOUT_S, moderator_llm: bool = True,
-                 fake: Optional[Callable[[ID, Any], dict]] = None):
+                 fake: Optional[Callable[[ID, Any], dict]] = None, context_index: Any = None):
         self.meeting = meeting
         self.briefs = briefs
         self.chat = chat
         self.lang = normalize(language or getattr(meeting, "language", "zh"))
-        self.fake = fake or FakeLLM(meeting, briefs)
+        self.context_index = context_index       # retrieval.ContextIndex | None：每个 bot 自己的完整笔记
+        self.fake = fake or FakeLLM(meeting, briefs, context_index)
         self.header_timeout = header_timeout
         self.header_max_chars = header_max_chars
         self.max_tokens = max_tokens
@@ -379,10 +395,38 @@ class LLMPlanner:
         return ps
 
     # —— 提示词 ——
-    def _member_messages(self, pid: ID, ctx: ChatCtxRecipe, brief: Brief, last: str) -> list[dict]:
+    def _retrieve(self, pid: ID, ctx: ChatCtxRecipe) -> list[Hit]:
+        """从 pid 自己的笔记里取回与这一轮相关的原文；没有索引 / 没命中 / 出任何错都是 []，不影响发言。"""
+        if not self.context_index:
+            return []
+        try:
+            main, extra = turn_query(ctx.turn_meta)
+            return self.context_index.search(pid, main, k=EXCERPT_K, extra=extra)
+        except Exception:  # noqa: BLE001
+            log.exception("笔记检索失败，本轮不带原文")
+            return []
+
+    @staticmethod
+    def _with_sources(fields: dict, header: dict, hits: list[Hit]) -> dict:
+        """头里的 sources 只认真的取回过的 id；provenance=context 没有有效来源就降成 model，有有效来源的 model 升成 context。"""
+        raw = header.get("sources")
+        known = {h.id for h in hits}
+        srcs = list(dict.fromkeys(s for s in raw if isinstance(s, str) and s in known)) if isinstance(raw, list) else []
+        if srcs:
+            fields["sources"] = srcs
+            if fields.get("provenance") == "model":
+                fields["provenance"] = "context"
+        elif fields.get("provenance") == "context":
+            fields["provenance"] = "model"
+        return fields
+
+    def _member_messages(self, pid: ID, ctx: ChatCtxRecipe, brief: Brief, last: str,
+                         hits: tuple[Hit, ...] | list[Hit] = ()) -> list[dict]:
         meta = ctx.turn_meta
         people = "; ".join(f"{p.id}={p.display_name}" for p in self.meeting.participants if p.id != pid)
         msgs = ctx.to_messages()
+        if hits:
+            msgs.append({"role": "user", "content": _excerpt_prompt(self.lang, format_excerpts(list(hits), EXCERPT_CHARS))})
         msgs.append({"role": "user", "content": _turn_prompt(
             self.lang, mandate_commit=list(brief.mandate.can_commit), mandate_ask=list(brief.mandate.must_ask),
             people=people, item=meta.get("agenda_title", ""),
@@ -460,13 +504,16 @@ class LLMPlanner:
                           last: str) -> AsyncIterator[str]:
         t0 = time.perf_counter()
         it = None
+        hits = self._retrieve(pid, ctx)
+        if hits:
+            ps.stats["retrieved"] = [h.id for h in hits]
         try:
             # 阶段 1：读到完整的头（带截止时间与长度上限）
             reason: Optional[str] = None
             header: Optional[dict] = None
             rest = ""
             try:
-                it = self._open(self._member_messages(pid, ctx, brief, last))
+                it = self._open(self._member_messages(pid, ctx, brief, last, hits))
                 parser = HeaderParser(self.header_max_chars)
                 deadline = t0 + self.header_timeout
                 while header is None:
@@ -509,7 +556,7 @@ class LLMPlanner:
                 ps.stats["guard"] = guard
                 yield line
                 return
-            ps.fields = verdict[1]
+            ps.fields = self._with_sources(verdict[1], header, hits)
 
             # 阶段 3：正文边到边送出
             spoken = False
@@ -581,8 +628,9 @@ class LLMPlanner:
 
 
 def build_planner(meeting: Meeting, briefs: dict[ID, Brief], chat: Any = None,
-                  language: Optional[str] = None, **kw: Any) -> Planner:
-    """chat 不为 None → LLM 规划器（回退用 FakeLLM）；否则就是 FakeLLM 的包装（测试 / sim / 无 key）。"""
+                  language: Optional[str] = None, *, context_index: Any = None, **kw: Any) -> Planner:
+    """chat 不为 None → LLM 规划器（回退用 FakeLLM）；否则就是 FakeLLM 的包装（测试 / sim / 无 key）。
+    context_index：retrieval.ContextIndex，成员发言时检索自己的完整笔记（两条路径都用）。"""
     if chat is None:
-        return CallablePlanner(FakeLLM(meeting, briefs))
-    return LLMPlanner(meeting, briefs, chat, language, **kw)
+        return CallablePlanner(FakeLLM(meeting, briefs, context_index))
+    return LLMPlanner(meeting, briefs, chat, language, context_index=context_index, **kw)

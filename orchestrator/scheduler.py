@@ -20,6 +20,8 @@ from .models import (
 
 W_RELEVANCE, W_CONFIDENCE, W_NOVELTY, W_ADDRESSED = 0.35, 0.25, 0.30, 0.10
 COOLDOWN_MAX_PENALTY = 0.3   # 刚说完时的最大冷却惩罚，15s 线性衰减到 0（初值，待调）
+NOTES_MIN_SCORE = 0.3        # 笔记检索命中达到这个归一化分数才算「强命中」，参与举手打分（比 search 的返回下限高）
+NOTES_CONFIDENCE = 0.7       # 强命中时的置信度下限（等同命中一条快照事实：0.4 + 0.3）
 
 
 # ———————————————————— 打分 ————————————————————
@@ -76,9 +78,10 @@ class RuleScorer:
 
     async_updates = False        # 规则版没有异步二次打分；scoring.LlmBatchScorer 置 True
 
-    def __init__(self, briefs: dict[ID, Brief], aliases: dict[ID, list[str]]):
+    def __init__(self, briefs: dict[ID, Brief], aliases: dict[ID, list[str]], context_index=None):
         self.briefs = briefs
         self.aliases = aliases
+        self.context_index = context_index       # retrieval.ContextIndex | None：bot 自己的完整笔记
         self._index: dict[ID, _BriefIndex] = {}
         self._alias_re: dict[ID, Optional[re.Pattern]] = {}
 
@@ -118,8 +121,22 @@ class RuleScorer:
         confidence = min(1.0, 0.4 + 0.3 * len(matched)) if matched else (0.6 if pos else 0.3)
         # gist：这个 bot 准备说的要点 = 命中的第一条事实，否则用本议程项立场
         gist = matched[0].value if matched else (pos.stance if pos else "")
+        note = self._notes_hit(bot_id, text)
+        if note is not None:     # 笔记里有强相关原文：像命中事实一样抬高置信度，计入相关度；没有事实时它的首句当要点
+            relevance = min(1.0, max(relevance, 1.5 * note.score))
+            confidence = max(confidence, NOTES_CONFIDENCE)
+            if not matched:
+                gist = note.first_sentence()
         novelty = 1.0 - max([similarity(gist, s) for s in said_in_item] or [0.0])
         return hand_score(relevance, confidence, novelty, self.addressed(bot_id, text), penalty), gist
+
+    def _notes_hit(self, bot_id: ID, text: str):
+        """bot 自己笔记里与这句发言最相关的一段，达到 NOTES_MIN_SCORE 才返回；没有索引 / 没命中返回 None。"""
+        ix = self.context_index
+        if not ix:
+            return None
+        hits = ix.search(bot_id, text, k=1, min_score=NOTES_MIN_SCORE)
+        return hits[0] if hits else None
 
     def add_bot(self, bot_id: ID, brief: Brief, aliases: list[str]) -> None:
         """会中加入的 bot：登记 brief 与称呼，丢掉可能残留的旧索引 / 称呼正则（索引按 brief 惰性重建）。"""

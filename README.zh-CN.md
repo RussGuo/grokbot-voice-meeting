@@ -124,7 +124,7 @@ flowchart LR
 2. `MEETING_JOIN_PAGE` 设成那个 `index.html` 的 URL。
 3. 打开 `meet` 打印的链接。浏览器直连 LiveKit Cloud，不必把 token 服务暴露到公网。
 
-房间 metadata 对所有持 token 的人可见，所以只写 `{"v":1,"room":{"topic","who"}}`。完整场景（含 brief）只走派发 metadata，并存在 `links/<room>.scene.json`（权限 600）。`scripts/dispatch.py --room R` 默认发送这个文件（`--scene FILE` 指定，`--no-scene` 不带）。链接可以转发，brief 不会跟着走。
+房间 metadata 对所有持 token 的人可见，所以只写 `{"v":1,"room":{"topic","who"}}`。完整场景（含 brief）只走派发 metadata，并存在 `links/<room>.scene.json`（权限 600）。`scripts/dispatch.py --room R` 默认发送这个文件（`--scene FILE` 指定，`--no-scene` 不带）。链接可以转发，brief 不会跟着走。各 bot 的完整 context 同理：`links/<room>.context.json`（权限 600）只留在本机，场景里只有它的路径和哈希。
 
 `python web/token_server.py` 仍留给本机开发（默认只绑 `127.0.0.1`）。它的 `/` 会列出可回放的运行。放到隧道后面时设置 `MEETING_ACCESS_KEY`：用 `Authorization: Bearer <key>` 头，或用它下发的 cookie。旧的 `?k=<key>` 仍可用但不推荐，查询串会留在地址栏和代理日志里。服务端不会把口令写进日志。
 

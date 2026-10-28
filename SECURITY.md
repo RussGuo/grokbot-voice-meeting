@@ -9,6 +9,7 @@ Include what you can do with the bug and how you reproduced it. Do not include l
 ## Secrets
 
 - `.env` is gitignored. `.env.example` has empty values.
+- `meet` also writes each stand-in's full exported context (chunked) to `links/<room>.context.json` mode `0600`. Only its path and sha256 go into the scene; the worker refuses a file whose hash differs.
 - `meet` writes the join URL to `links/<room>.txt` mode `0600`. The URL contains a LiveKit token. Treat it as a credential: it can publish into that room until it expires.
 - `bots.yaml` and `contexts/` are gitignored. Briefs can contain private notes.
 - `meet doctor` prints whether a variable is set, never its value.

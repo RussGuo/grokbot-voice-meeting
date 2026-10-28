@@ -65,7 +65,7 @@ class Orchestrator:
     def __init__(self, meeting: Meeting, briefs: dict[ID, Brief], voice: VoiceLayer,
                  principal_factory: Callable[["Orchestrator"], PrincipalClient],
                  clock: Callable[[], Millis], log_path=None, summarizer=None, scorer_chat: Any = None,
-                 addable_bots: Optional[dict[ID, str]] = None):
+                 addable_bots: Optional[dict[ID, str]] = None, context_index: Any = None):
         self.m = meeting
         self.briefs = briefs
         self.voice = voice
@@ -82,7 +82,7 @@ class Orchestrator:
         # 打分器：MEETING_SCORER=rule（默认）| llm。llm 需要 scorer_chat（有 astream_text 的 LLM 客户端），
         # 缺省则退回规则版；结果以 scorer.update 事件投回 inbox（与 principal.answered 同一条路）。
         self.scorer = build_scorer(briefs, {p.id: p.aliases + [p.display_name] for p in meeting.participants},
-                                   chat=scorer_chat)
+                                   chat=scorer_chat, context_index=context_index)   # 笔记检索（可无）：见 retrieval.py
         self.scorer.bind(deliver_to(self))
         self._scorer_ctx: Optional[tuple[int, ID, str, ID]] = None   # (seq, 议程项, 发言, 说话人)：最近一次 fan-out
         self._rule_hands: dict[ID, ID] = {}                          # bot -> 该次 fan-out 里规则分举的手
@@ -720,6 +720,7 @@ class Orchestrator:
                       text=ev["text"], started_at=self._first_audio_at or self._turn_started or self.now(),
                       ended_at=self.now(), token_id=tok.id, provenance=ev.get("provenance"),
                       confidence=ev.get("confidence"), addressees=ev.get("addressees", []),
+                      sources=[s for s in (ev.get("sources") or []) if isinstance(s, str)][:6],
                       ducked=list(getattr(self, "_ducks", [])))
         planned = [t for t in (ev.get("commitments") or []) if t]
         spoken = commitments_in_speech(ev.get("text") or "", self.briefs[pid].mandate.can_commit if pid in self.briefs else [])

@@ -210,9 +210,10 @@ class Utterance(Serializable):
     interrupted: Optional[dict[str, Any]] = None   # {"by": ID, "at_char": int}
     ducked: list[dict[str, Any]] = field(default_factory=list)  # [{"at": ms, "restored": bool}]
     addressees: list[ID] = field(default_factory=list)
-    provenance: Optional[Literal["brief", "snapshot", "principal", "model"]] = None
+    provenance: Optional[Literal["brief", "snapshot", "principal", "model", "context"]] = None
     confidence: Optional[float] = None
     commitments: list[Commitment] = field(default_factory=list)
+    sources: list[str] = field(default_factory=list)   # provenance=context 时引用的笔记段落 id（<bot_id>#<n>）
 
 
 @dataclass

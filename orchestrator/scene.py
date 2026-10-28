@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any
 
 from .config import human_identity
@@ -49,8 +50,11 @@ def bot_participant(bid: str, meta: dict, voice: str, language: str = "zh") -> d
 def build_scene(*, who: list[str], topic: str, agenda: list[str] | None, briefs: dict[str, dict],
                 voices: dict[str, str], registry: dict[str, dict], language: str = "zh",
                 human_id: str | None = None, human_name: str | None = None,
-                moderator_id: str | None = None, moderator_name: str | None = None) -> dict[str, Any]:
-    """Assemble the scene dict `make_link` stores as room and dispatch metadata."""
+                moderator_id: str | None = None, moderator_name: str | None = None,
+                context_bundle: dict[str, str] | None = None) -> dict[str, Any]:
+    """Assemble the scene dict `make_link` stores as room and dispatch metadata.
+
+    context_bundle = {"path", "sha256"} of the full-context file (meet/context_bundle.py); the worker indexes it."""
     lang = normalize(language or _env("MEETING_LANG", "zh"))
     hid = human_id or human_identity()
     hname = human_name or _env("MEETING_HUMAN_NAME") or human_name_default(lang)
@@ -88,7 +92,7 @@ def build_scene(*, who: list[str], topic: str, agenda: list[str] | None, briefs:
     }]
     for bid in who:
         participants.append(bot_participant(bid, registry.get(bid, {}), voices.get(bid, ""), lang))
-    return {
+    scene: dict[str, Any] = {
         "version": 1,
         "topic": topic,
         "title": topic,
@@ -101,6 +105,9 @@ def build_scene(*, who: list[str], topic: str, agenda: list[str] | None, briefs:
         "briefs": briefs,
         "voices": voices,
     }
+    if context_bundle:
+        scene["context_bundle"] = {"path": str(context_bundle["path"]), "sha256": str(context_bundle["sha256"])}
+    return scene
 
 
 def _agenda_from(data: dict) -> list[dict]:
@@ -207,8 +214,32 @@ def _empty_moderator_brief(mid: str, meeting: Meeting, lang: str) -> Brief:
     })
 
 
-def load_scene_metadata(*blobs: str | None) -> tuple[Meeting, dict[str, Brief], dict[str, str]] | None:
-    """First non-empty JSON object that looks like a scene wins. Returns meeting, briefs, voices."""
+class SceneLoad(tuple):
+    """load_scene_metadata 的返回值：照旧是 (meeting, briefs, voices) 三元组，可以直接解包；
+    另带 .context_bundle = {"path", "sha256"} | None（完整 context 文件的位置与哈希，见 meet/context_bundle.py）。"""
+
+    context_bundle: dict[str, str] | None
+
+    def __new__(cls, meeting, briefs, voices, context_bundle=None):
+        self = super().__new__(cls, (meeting, briefs, voices))
+        self.context_bundle = context_bundle
+        return self
+
+
+_HEX64 = re.compile(r"[0-9a-fA-F]{64}")
+
+
+def _bundle_ref(raw: Any) -> dict[str, str] | None:
+    if not isinstance(raw, dict):
+        return None
+    path, digest = raw.get("path"), raw.get("sha256")
+    if isinstance(path, str) and path and isinstance(digest, str) and _HEX64.fullmatch(digest):
+        return {"path": path, "sha256": digest.lower()}
+    return None
+
+
+def load_scene_metadata(*blobs: str | None) -> SceneLoad | None:
+    """First non-empty JSON object that looks like a scene wins. Returns meeting, briefs, voices (+ .context_bundle)."""
     for raw in blobs:
         if not raw or not str(raw).strip():
             continue
@@ -226,5 +257,5 @@ def load_scene_metadata(*blobs: str | None) -> tuple[Meeting, dict[str, Brief], 
         voices = data.get("voices") or {}
         if not isinstance(voices, dict):
             voices = {}
-        return meeting, briefs, {str(k): str(v) for k, v in voices.items()}
+        return SceneLoad(meeting, briefs, {str(k): str(v) for k, v in voices.items()}, _bundle_ref(data.get("context_bundle")))
     return None

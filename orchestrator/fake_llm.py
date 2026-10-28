@@ -9,16 +9,18 @@ from __future__ import annotations
 
 from typing import Any
 
-from .i18n import member_lines, moderator_lines, normalize
+from .i18n import member_lines, moderator_lines, normalize, notes_line
 from .models import ID, Brief, ChatCtxRecipe, Meeting
+from .retrieval import turn_query
 
 CONFIDENCE_THRESHOLD = 0.6
 
 
 class FakeLLM:
-    def __init__(self, meeting: Meeting, briefs: dict[ID, Brief]):
+    def __init__(self, meeting: Meeting, briefs: dict[ID, Brief], context_index: Any = None):
         self.meeting = meeting
         self.briefs = briefs
+        self.context_index = context_index     # retrieval.ContextIndex | None：没有快照事实命中时引用自己的笔记
         self._lines = member_lines(getattr(meeting, "language", "zh"))     # 成员台词模板，按会议语言
 
     def __call__(self, pid: ID, ctx: ChatCtxRecipe) -> dict[str, Any]:
@@ -54,11 +56,21 @@ class FakeLLM:
         facts = [f for f in brief.memory_snapshot.facts if f.key.split(".")[-1] in last or f.value[:4] in last]
         if not facts and gist:
             facts = [f for f in brief.memory_snapshot.facts if f.value == gist]
+        hit = None
+        if not facts and self.context_index:
+            main, extra = turn_query(meta)
+            hits = self.context_index.search(pid, main, k=1, extra=extra)
+            hit = hits[0] if hits else None
         if facts:
             f = facts[0]
             text = self._lines["snapshot"].format(key=f.key, value=f.value)
             conf = 0.8
             prov = "snapshot"
+        elif hit is not None:            # 快照没命中但自己的笔记里有相关原文：念首句，标 context 并带上来源段落 id
+            text = notes_line(getattr(self.meeting, "language", "zh")).format(text=hit.first_sentence())
+            conf = 0.7
+            prov = "context"
+            sources = [hit.id]
         else:
             pos = next((p for p in brief.positions if p.agenda_item_id == meta.get("agenda_item_id")), None)
             stance = pos.stance if pos else self._lines["no_stance"]
@@ -72,5 +84,7 @@ class FakeLLM:
         if meta.get("addressed") and conf < CONFIDENCE_THRESHOLD:
             return {"text": self._lines["beyond"], "provenance": "model",
                     "confidence": conf, "ask_principal": last, "commitments": [], "addressees": []}
-        return {"text": text, "provenance": prov, "confidence": conf,
-                "commitments": [], "addressees": []}
+        out = {"text": text, "provenance": prov, "confidence": conf, "commitments": [], "addressees": []}
+        if prov == "context":
+            out["sources"] = sources
+        return out

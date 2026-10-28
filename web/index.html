@@ -247,7 +247,7 @@ function sysline(text, cls = "") {
 }
 
 /* ---------------- 事件归约 ---------------- */
-const PROV = { snapshot: "快照", brief: "brief", principal: "本体", model: "" };
+const PROV = { snapshot: "快照", brief: "brief", principal: "本体", context: "笔记", model: "" };
 function apply(ev) {
   const d = ev.data || {}, at = ev.at ?? S.now; S.now = Math.max(S.now, at);
   switch (ev.type) {

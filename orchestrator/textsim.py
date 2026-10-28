@@ -73,6 +73,13 @@ def tokens(text: str) -> set[str]:
     return set(en_terms(text)) | bigrams
 
 
+def token_list(text: str) -> list[str]:
+    """tokens() 的多重集版本（保留重复，BM25 要词频）：英文内容词 + 中文字二元组。"""
+    text = text.lower()
+    han = "".join(_HAN.findall(text))
+    return en_terms(text) + [han[i:i + 2] for i in range(len(han) - 1)]
+
+
 def overlap(ta: set[str], tb: set[str]) -> float:
     if not ta or not tb:
         return 0.0
