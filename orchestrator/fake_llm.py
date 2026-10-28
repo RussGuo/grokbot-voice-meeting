@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .i18n import moderator_lines, normalize
+from .i18n import member_lines, moderator_lines, normalize
 from .models import ID, Brief, ChatCtxRecipe, Meeting
 
 CONFIDENCE_THRESHOLD = 0.6
@@ -19,6 +19,7 @@ class FakeLLM:
     def __init__(self, meeting: Meeting, briefs: dict[ID, Brief]):
         self.meeting = meeting
         self.briefs = briefs
+        self._lines = member_lines(getattr(meeting, "language", "zh"))     # 成员台词模板，按会议语言
 
     def __call__(self, pid: ID, ctx: ChatCtxRecipe) -> dict[str, Any]:
         meta = ctx.turn_meta
@@ -26,7 +27,7 @@ class FakeLLM:
         if pid == self.meeting.moderator.participant_id:
             return self._moderator(intent, meta)
         if intent == "relay":
-            return {"text": f"本体回复了：{meta.get('answer', '')}", "provenance": "principal",
+            return {"text": self._lines["relay"].format(answer=meta.get("answer", "")), "provenance": "principal",
                     "confidence": 0.95, "commitments": [], "addressees": []}
         return self._member(pid, meta)
 
@@ -36,7 +37,7 @@ class FakeLLM:
         lang = normalize(getattr(self.meeting, "language", "zh"))
         cos = self.meeting.moderator.mode == "chiefOfStaff"
         texts = moderator_lines(lang, chief=cos)
-        text = texts.get(intent, "好的。" if lang == "zh" else "Okay.")
+        text = texts.get(intent, self._lines["okay"])
         text = text.format(item=item, recap=meta.get("recap_item", ""), target=meta.get("target_name", ""))
         return {"text": text, "provenance": "model", "confidence": 1.0,
                 "commitments": [], "addressees": [human] if intent == "ask_human" else []}
@@ -48,28 +49,28 @@ class FakeLLM:
         # mustAsk 命中 → 慢路径
         for term in brief.mandate.must_ask:
             if term and term in last:
-                return {"text": f"「{term}」这个我需要问一下本体，稍后补充。", "provenance": "model",
+                return {"text": self._lines["ask_term"].format(term=term), "provenance": "model",
                         "confidence": 0.3, "ask_principal": last, "commitments": [], "addressees": []}
         facts = [f for f in brief.memory_snapshot.facts if f.key.split(".")[-1] in last or f.value[:4] in last]
         if not facts and gist:
             facts = [f for f in brief.memory_snapshot.facts if f.value == gist]
         if facts:
             f = facts[0]
-            text = f"按会前快照（{f.key}）：{f.value}"
+            text = self._lines["snapshot"].format(key=f.key, value=f.value)
             conf = 0.8
             prov = "snapshot"
         else:
             pos = next((p for p in brief.positions if p.agenda_item_id == meta.get("agenda_item_id")), None)
-            stance = pos.stance if pos else "我暂时没有补充。"
-            text = f"我的立场是：{stance}"
+            stance = pos.stance if pos else self._lines["no_stance"]
+            text = self._lines["stance"].format(stance=stance)
             conf = 0.65 if not meta.get("addressed") else 0.5
             prov = "brief"
         commitments = [c for c in brief.mandate.can_commit if c and c in last]
         if commitments:      # mandate.canCommit 范围内：当场答应（决策 1：binding）
-            return {"text": f"可以，这件事我当场答应：{commitments[0]}。", "provenance": "brief",
+            return {"text": self._lines["commit"].format(commitment=commitments[0]), "provenance": "brief",
                     "confidence": 0.85, "commitments": commitments[:1], "addressees": []}
         if meta.get("addressed") and conf < CONFIDENCE_THRESHOLD:
-            return {"text": "这个超出我的会前快照，我问一下本体，稍后补充。", "provenance": "model",
+            return {"text": self._lines["beyond"], "provenance": "model",
                     "confidence": conf, "ask_principal": last, "commitments": [], "addressees": []}
         return {"text": text, "provenance": prov, "confidence": conf,
                 "commitments": [], "addressees": []}

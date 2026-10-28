@@ -111,3 +111,130 @@ def human_name_default(lang: str | None) -> str:
 
 def moderator_name_default(lang: str | None) -> str:
     return "Host" if normalize(lang) == "en" else "主持人"
+
+
+# ———————————————————— 行为文本：FakeLLM 成员台词、议程结论、纪要标签 ————————————————————
+
+def member_lines(lang: str | None) -> dict[str, str]:
+    """FakeLLM 里成员 bot 的模板句。占位符由调用方 format。"""
+    if normalize(lang) == "en":
+        return {
+            "relay": "My principal replied: {answer}",
+            "ask_term": "I need to ask my principal about \"{term}\" and will follow up.",
+            "snapshot": "Per the pre-meeting snapshot ({key}): {value}",
+            "stance": "My position: {stance}",
+            "no_stance": "I have nothing to add for now.",
+            "commit": "Sure, I'll commit to this now: {commitment}.",
+            "beyond": "That is beyond my pre-meeting snapshot. I'll ask my principal and follow up.",
+            "okay": "Okay.",
+        }
+    return {
+        "relay": "本体回复了：{answer}",
+        "ask_term": "「{term}」这个我需要问一下本体，稍后补充。",
+        "snapshot": "按会前快照（{key}）：{value}",
+        "stance": "我的立场是：{stance}",
+        "no_stance": "我暂时没有补充。",
+        "commit": "可以，这件事我当场答应：{commitment}。",
+        "beyond": "这个超出我的会前快照，我问一下本体，稍后补充。",
+        "okay": "好的。",
+    }
+
+
+def end_button(lang: str | None) -> str:
+    return "(end button)" if normalize(lang) == "en" else "（结束按钮）"
+
+
+def cut_off(lang: str | None, played_chars: int) -> str:
+    if normalize(lang) == "en":
+        return f"(cut off after {played_chars} characters)"
+    return f"（已播 {played_chars} 字后被截断）"
+
+
+def speaker_line(lang: str | None, name: str, text: str) -> str:
+    """bot 共享纪要（chat_ctx.shared_minutes）里的一条发言。"""
+    return f"{name}: {text}" if normalize(lang) == "en" else f"{name}：{text}"
+
+
+def minutes_tag(lang: str | None) -> str:
+    """bot 共享纪要（喂给各 bot 的 chat_ctx）里决策行的前缀。"""
+    return "[Decision]" if normalize(lang) == "en" else "[决策]"
+
+
+def decision_text(lang: str | None, conclusion: str = "", open_questions: str = "",
+                  actions: list[str] | None = None) -> str:
+    """议程项结论文本。conclusion 为空 → 「未形成明确结论」；不含任何示例/example 字样。"""
+    en = normalize(lang) == "en"
+    strip = " 。.！!；;"
+    parts = [conclusion.strip().rstrip(strip) or ("No clear conclusion recorded" if en else "未形成明确结论")]
+    if open_questions.strip():
+        parts.append(("open questions: " if en else "待定问题：") + open_questions.strip().rstrip(strip))
+    if actions:
+        parts.append(("actions: " if en else "行动项：") + (", " if en else "、").join(actions))
+    return ("; " if en else "；").join(parts)
+
+
+def minutes_labels(lang: str | None) -> dict[str, str]:
+    """minutes.md 的标题与标签。zh 与历史输出逐字一致（scripts/acceptance.py 依赖其中几个）。"""
+    if normalize(lang) == "en":
+        return {
+            "title": "# Minutes: {title}",
+            "note": "(Generated from the event log; commitments made by stand-ins are binding at once and reconciled by their principals afterwards.)",
+            "agenda": "## Agenda",
+            "decisions": "## Decisions",
+            "transcript": "## Transcript",
+            "floor": "## Speaking order (raised hands)",
+            "actions": "## Action items (by owner)",
+            "followup": "## Follow-ups (principal answers not delivered in the meeting)",
+            "none": "- None",
+            "decision_item": "- \"{title}\": {text}",
+            "tag_hand": "[hand raised] ",
+            "tag_pending": "[principal reply inserted] ",
+            "prov": " ({prov})",
+            "utt": "- {t:6.1f}s [{ag}] {name}{tag}: {text}",
+            "hands": "- Hands raised: {n}; granted the floor: {m}",
+            "hand": "- {t:6.1f}s {name} raised a hand: {gist}{score} -> {result}",
+            "score": ", score {s:.2f}",
+            "no_gist": "(no summary)",
+            "r_expired": "expired",
+            "r_withdrawn": "withdrawn",
+            "r_granted": "granted the floor at {t:.1f}s",
+            "r_queued": "not reached",
+            "end": "- Adjourned: {t:.1f}s {how}{quote}",
+            "end_quote": " (\"{text}\")",
+            "end_human_command": "the user announced the end",
+            "end_confirmed": "the user confirmed the end",
+            "end_timeout": "ended after no response",
+            "action": "- {owner}: {title} ({status})",
+            "deferred": "- {who}: {q}",
+        }
+    return {
+        "title": "# 纪要：{title}",
+        "note": "（由事件流生成；分身承诺当场生效，会后由本体对账）",
+        "agenda": "## 议程",
+        "decisions": "## 决策",
+        "transcript": "## 发言记录",
+        "floor": "## 发言秩序（举手申请）",
+        "actions": "## 行动项（按 owner）",
+        "followup": "## 会后补充（本体答案未在会上送达）",
+        "none": "- 无",
+        "decision_item": "- 「{title}」：{text}",
+        "tag_hand": "【举手】",
+        "tag_pending": "【本体答复插回】",
+        "prov": "（{prov}）",
+        "utt": "- {t:6.1f}s [{ag}] {name}{tag}：{text}",
+        "hands": "- 举手 {n} 次，获准发言 {m} 次",
+        "hand": "- {t:6.1f}s {name} 举手：{gist}{score} → {result}",
+        "score": "，得分 {s:.2f}",
+        "no_gist": "（无摘要）",
+        "r_expired": "过期",
+        "r_withdrawn": "撤回",
+        "r_granted": "{t:.1f}s 获准发言",
+        "r_queued": "未轮到",
+        "end": "- 散会：{t:.1f}s {how}{quote}",
+        "end_quote": "（「{text}」）",
+        "end_human_command": "用户宣布结束",
+        "end_confirmed": "用户确认结束",
+        "end_timeout": "无人回应超时结束",
+        "action": "- {owner}：{title}（{status}）",
+        "deferred": "- {who}：{q}",
+    }

@@ -36,6 +36,7 @@ EXTRA_TYPES = {
     "SpeakerPublished",    # 发给 web/ 的 meeting.speaker / meeting.roster 数据消息（审计用）
     "EndConfirm",          # 最后一项冷场：主持人询问是否结束 / 用户确认 / 继续 / 超时结束
     "ContextTruncated",    # chat_ctx 里的 brief / 快照超长被截断
+    "DecisionSummarized",  # 议程项结论的后台总结落地（覆盖同一项 DecisionRecorded 里的兜底文本）
     "HumanDirective",      # 用户的口头指令（如「先让工程说说成本」）：stage=parsed / executed
 }
 
@@ -131,7 +132,7 @@ def project(events: Iterable[MeetingEvent]) -> dict[str, Any]:
     view: dict[str, Any] = {
         "utterances": [], "commitments": {}, "floor_history": [], "decisions": [],
         "queries": {}, "agenda_started": [], "interruptions": 0, "ducks": 0, "restores": 0,
-        "dropped_outputs": 0, "recaps": 0, "agent_switches": 0, "last_seq": 0,
+        "dropped_outputs": 0, "recaps": 0, "agent_switches": 0, "last_seq": 0, "_decision_idx": {},
     }
     for e in events:
         if e.seq != view["last_seq"] + 1:
@@ -154,6 +155,11 @@ def project(events: Iterable[MeetingEvent]) -> dict[str, Any]:
             view["floor_history"].append((t, tok["id"], tok["holder_id"], tok["source"]))
         elif t == "DecisionRecorded":
             view["decisions"].append(d.get("payload", {}).get("text"))
+            view["_decision_idx"][d.get("payload", {}).get("agenda_item_id")] = len(view["decisions"]) - 1
+        elif t == "DecisionSummarized":
+            i = view["_decision_idx"].get(d["payload"].get("agenda_item_id"))
+            if i is not None:
+                view["decisions"][i] = d["payload"]["text"]
         elif t in ("PrincipalAsked", "PrincipalAnswered", "PrincipalExpired", "PrincipalDeferred"):
             q = d["query"]
             view["queries"][q["id"]] = q["status"]
@@ -171,4 +177,5 @@ def project(events: Iterable[MeetingEvent]) -> dict[str, Any]:
             view["recaps"] += 1
         elif t == "AgentSwitched":
             view["agent_switches"] += 1
+    view.pop("_decision_idx")
     return view

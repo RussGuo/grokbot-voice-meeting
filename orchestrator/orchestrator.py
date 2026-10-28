@@ -20,7 +20,12 @@ from typing import Any, Callable, Optional
 from .brief_compact import compact_brief, compact_snapshot
 from .commitments import commitments_in_speech
 from .events import EventLog
+from .i18n import cut_off as i18n_cut_off
+from .i18n import end_button as i18n_end_button
+from .i18n import minutes_tag as i18n_minutes_tag
+from .i18n import normalize as i18n_normalize
 from .i18n import rules as i18n_rules
+from .i18n import speaker_line as i18n_speaker_line
 from .i18n import turn as i18n_turn
 from .models import (
     ID, Brief, ChatCtxRecipe, Commitment, FloorToken, Meeting, Millis,
@@ -29,6 +34,7 @@ from .models import (
 from .principal import PrincipalClient
 from .scheduler import Candidate, Cue, RuleScorer, Scheduler, cooldown_penalty
 from .state_machine import Floor, MeetingStateMachine, Phase
+from .summarize import SummaryRequest, fallback_text
 from .voice_iface import VoiceLayer
 
 F = Floor
@@ -38,7 +44,7 @@ log = logging.getLogger("orchestrator")
 class Orchestrator:
     def __init__(self, meeting: Meeting, briefs: dict[ID, Brief], voice: VoiceLayer,
                  principal_factory: Callable[["Orchestrator"], PrincipalClient],
-                 clock: Callable[[], Millis], log_path=None):
+                 clock: Callable[[], Millis], log_path=None, summarizer=None):
         self.m = meeting
         self.briefs = briefs
         self.voice = voice
@@ -87,6 +93,8 @@ class Orchestrator:
         self._vad_started_at: Millis = 0
         self._directive_seen: set[str] = set()
         self._transcript_after_eot = False
+        self.summarizer = summarizer                    # async (SummaryRequest) -> str|None；None → 只用兜底结论
+        self._summary_tasks: dict[ID, asyncio.Task] = {}   # 议程项 id → 后台总结任务
 
     # ———————————————————— 基础设施 ————————————————————
     def now(self) -> Millis:
@@ -184,13 +192,22 @@ class Orchestrator:
         """InAgenda → Deciding → 下一项 / Closing。"""
         item = self.m.current_agenda
         self.sm.to_phase(Phase.DECIDING)
-        binding = [c.text for c in self.commitments.values()
-                   if c.status == "binding" and any(u.id == c.utterance_id and u.agenda_item_id == item.id for u in self.utterances)]
-        text = f"「{item.title}」结论（示例）：" + ("；".join(binding) if binding else "讨论充分，暂无行动项")
+        lang = getattr(self.m, "language", "zh")
+        mine = [u for u in self.utterances if u.agenda_item_id == item.id]
+        ids = {u.id for u in mine}
+        binding = [c.text for c in self.commitments.values() if c.status == "binding" and c.utterance_id in ids]
+        # 先写确定性兜底并立即推进；LLM 总结在后台跑，落地后再发 DecisionSummarized（不 await：慢调用会拖住用户语音事件）
+        text = fallback_text(lang, binding)
         item.status = "decided"
-        self.emit("DecisionRecorded", payload={"agenda_item_id": item.id, "text": text, "method": "consensus"})
+        self.emit("DecisionRecorded", payload={"agenda_item_id": item.id, "title": item.title, "text": text,
+                                               "method": "pending" if self.summarizer else "fallback"})
         self.emit("AgendaItemClosed", agenda_item_id=item.id)
-        self.minutes.append(f"[决策] {text}")
+        self.minutes.append(self._decision_line(lang, item.title, text))
+        if self.summarizer:
+            req = SummaryRequest(
+                item_title=item.title, language=lang, commitments=binding,
+                utterances=[(self.name(u.speaker_id), u.text) for u in mine if not u.interrupted])
+            self._summary_tasks[item.id] = asyncio.create_task(self._summarize(item.id, item.title, text, req))
         if self.m.current_agenda_idx + 1 < len(self.m.agenda) and not self._human_ended:
             self.m.current_agenda_idx += 1
             self.sm.to_phase(Phase.IN_AGENDA)
@@ -198,6 +215,42 @@ class Orchestrator:
             await self.schedule()
         else:
             await self.close()
+
+    def _decision_line(self, lang: str, title: str, text: str) -> str:
+        return f"{i18n_minutes_tag(lang)} \"{title}\": {text}" if i18n_normalize(lang) == "en" else f"{i18n_minutes_tag(lang)} 「{title}」：{text}"
+
+    async def _summarize(self, item_id: ID, title: str, fallback: str, req: SummaryRequest) -> None:
+        """后台任务：总结完成后发 DecisionSummarized，并把共享纪要里的兜底行原位换掉（bot 之后看到的是总结）。"""
+        try:
+            text = await self.summarizer(req)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.warning("议程总结失败：%s", type(e).__name__)
+            return
+        if not text or text == fallback:
+            return
+        self.emit("DecisionSummarized", payload={"agenda_item_id": item_id, "title": title, "text": text,
+                                                 "method": "llm"})
+        lang = getattr(self.m, "language", "zh")
+        old = self._decision_line(lang, title, fallback)
+        for i in range(len(self.minutes) - 1, -1, -1):
+            if self.minutes[i] == old:
+                self.minutes[i] = self._decision_line(lang, title, text)
+                break
+
+    SUMMARY_WAIT_S = 6.0        # close() 等后台总结的总上限（秒，真实时间）
+
+    async def _drain_summaries(self) -> None:
+        tasks = [t for t in self._summary_tasks.values() if not t.done()]
+        if tasks:
+            _, pending = await asyncio.wait(tasks, timeout=self.SUMMARY_WAIT_S)
+            for t in pending:                      # 超时的保留兜底结论，不再等
+                t.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+                log.warning("%d 个议程总结超时，纪要保留兜底结论", len(pending))
+        self._summary_tasks.clear()
 
     async def close(self) -> None:
         if self.sm.phase == Phase.IN_AGENDA:
@@ -213,6 +266,7 @@ class Orchestrator:
                     self.sm.pending_count = max(0, self.sm.pending_count - 1)
                 q.status = "deferredToMinutes"
                 self.emit("PrincipalDeferred", query=q, reason="meeting_end")
+        await self._drain_summaries()          # 纪要从事件流生成：总结要赶在 MeetingEnded 之前落地
         self.emit("MeetingEnded", minutesId=f"minutes-{self.m.id}")
         self.sm.to_phase(Phase.POST_MEETING)
         self.m.status = "post"
@@ -373,7 +427,7 @@ class Orchestrator:
 
     # —— 网页控制（meeting.control，main.py 已校验发送方是用户）——
     async def _on_control_end(self, ev):
-        await self._human_end(ev.get("text") or "（结束按钮）")
+        await self._human_end(ev.get("text") or i18n_end_button(getattr(self.m, "language", "zh")))
 
     async def _on_control_interrupt(self, ev):
         """打断按钮 = 用户开口打断：bot 立即停，令牌给用户；他若不说话，6s 后自动释放。"""
@@ -831,7 +885,7 @@ class Orchestrator:
     def _append_utterance(self, u: Utterance) -> None:
         self.utterances.append(u)
         self.emit("UtteranceFinal", utterance=u)
-        self.minutes.append(f"{self.name(u.speaker_id)}：{u.text}")
+        self.minutes.append(i18n_speaker_line(getattr(self.m, "language", "zh"), self.name(u.speaker_id), u.text))
         self._fan_out(u)
 
     def _fan_out(self, u: Utterance) -> None:
@@ -858,7 +912,7 @@ class Orchestrator:
 
     def _record_bot_partial(self, tok: FloorToken, played_chars: int) -> None:
         u = Utterance(id=f"utt-{next(self._utt_ids)}", speaker_id=tok.holder_id, agenda_item_id=self.agenda_id,
-                      text=f"（已播 {played_chars} 字后被截断）", started_at=self._turn_started or self.now(),
+                      text=i18n_cut_off(getattr(self.m, "language", "zh"), played_chars), started_at=self._turn_started or self.now(),
                       ended_at=self.now(), token_id=tok.id,
                       interrupted={"by": self.human_id, "at_char": played_chars}, ducked=list(self._ducks))
         self.utterances.append(u)
